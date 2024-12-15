@@ -206,12 +206,12 @@ class CLIPransformerSS(pl.LightningModule):
                 if "prompt_learner" not in name and "prompt" not in name and 'ln_final' not in name and 'ln_post' not in name and name.split('.')[-1]!='proj':
                     param.requires_grad_(False)
 
-            # Double check
-            enabled = set()
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    enabled.add(name)
-            print(f"Parameters to be updated: {enabled}")
+            # # Double check
+            # enabled = set()
+            # for name, param in self.model.named_parameters():
+            #     if param.requires_grad:
+            #         enabled.add(name)
+            # print(f"Parameters to be updated: {enabled}")
 
         clip_utils.set_metrics(self)
         self.current_tasks = list()

@@ -600,5 +600,5 @@ def build_model(state_dict: dict, prompt_length, prompt_depth):
         model.load_state_dict(state_dict)
     except:
         missing_keys, _ = model.load_state_dict(state_dict, strict=False)
-        print('Weights not found for some missing keys: ', missing_keys)
+        #print('Weights not found for some missing keys: ', missing_keys)
     return model
