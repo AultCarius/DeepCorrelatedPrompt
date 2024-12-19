@@ -40,6 +40,10 @@ python run.py with data_root=<ARROW_ROOT> \
         <task_finetune_mmimdb or task_finetune_food101 or task_finetune_hatememes> \
         exp_name=<EXP_NAME>
 ```
+Example command:
+```
+python run.py with data_root=/path_to_mmimdb num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb exp_name=exp_base
+```
 ### Evaluation
 ```
 python run.py with data_root=<ARROW_ROOT> \
@@ -54,7 +58,10 @@ python run.py with data_root=<ARROW_ROOT> \
         test_type=<TEST_TYPE> \
         test_only=True     
 ```
-
+Example command:
+```
+python run.py with data_root=/path_to_mmimd num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=/path_to_your_pretrained.ckpt test_only=True test_ratio=0.7 test_type=both exp_name=exp_test
+```
 ## Citation
 If you find this work useful for your research, please cite:
 ```Bibtex
