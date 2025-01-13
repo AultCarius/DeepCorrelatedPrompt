@@ -62,6 +62,7 @@ Example command:
 ```
 python run.py with data_root=/path_to_mmimd num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=/path_to_your_pretrained.ckpt test_only=True test_ratio=0.7 test_type=both exp_name=exp_test
 ```
+The `/path_to_your_pretrained.ckpt` could be the `.pt` file with prefix `epoch-` in the output folder.
 ## Citation
 If you find this work useful for your research, please cite:
 ```Bibtex
