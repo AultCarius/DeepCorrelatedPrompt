@@ -6,13 +6,13 @@ parser.add_argument('--target', default='./datasets', type=str, help='Root of da
 args = parser.parse_args()
 
 if args.dataset.lower() == 'mmimdb':
-    from vilt.utils.write_mmimdb import make_arrow
+    from clip.utils.write_mmimdb import make_arrow
     make_arrow(args.root, args.target)
     
 elif args.dataset.lower() == 'food101':
-    from vilt.utils.write_food101 import make_arrow
+    from clip.utils.write_food101 import make_arrow
     make_arrow(args.root, args.target)
     
 elif args.dataset.lower() == 'hateful_memes':
-    from vilt.utils.write_hatememes import make_arrow
+    from clip.utils.write_hatememes import make_arrow
     make_arrow(args.root, args.target)
