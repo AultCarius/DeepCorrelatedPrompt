@@ -76,3 +76,9 @@ If you find this work useful for your research, please cite:
 
 ## Acknowledgements
 This code is based on [ViLT](https://github.com/dandelin/ViLT.git), [CLIP](https://github.com/openai/CLIP) and [MMP](https://github.com/yilunlee/missing_aware_prompts). Many thanks for their contributions. 
+
+```python
+
+python run.py with data_root=datasets num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb exp_name=exp_base
+
+```

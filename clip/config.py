@@ -14,7 +14,10 @@ def _loss_names(d):
         "irtr": 0,
         "mmimdb": 0,
         "hatememes": 0,
-        "food101": 0,        
+        "food101": 0,
+        "modal_generation": 0,
+        "cycle_consistency": 0,
+        "quality_estimation": 0,
     }
     ret.update(d)
     return ret
@@ -97,6 +100,38 @@ def config():
     load_path = ""
     num_workers = 8
     precision = 16
+
+    # 【新增】模态生成器配置 - 必须在主config中定义
+    modal_generator_config = {
+        'hidden_size': 512,
+        'num_layers': 3,
+        'num_heads': 8,
+        'dropout': 0.1
+    }
+
+    # 【新增】循环一致性损失权重 - 必须在主config中定义
+    cycle_loss_weight = 0.02
+    # 【新增】质量评估配置
+    quality_estimator_config = {
+        'hidden_size': 512,
+        'fusion_strategy': 'weighted'  # 'weighted' 或 'attention'
+    }
+
+    # 【新增】质量监督损失权重
+    quality_loss_weight = 0.01
+
+    # 【新增】分阶段训练配置
+    warmup_epochs = 5  # 前5轮只训练基础组件
+    quality_aware_epochs = 10  # 接下来10轮启用质量感知
+
+    # 【新增】质量感知prompt配置
+    quality_aware_prompt_config = {
+        'adaptation_weight_init': 0.1,  # 初始自适应权重
+        'max_iterations': 2,  # 最大迭代次数
+        'early_stop_threshold': 0.01  # 早停阈值
+    }
+
+
 
 
 # Named configs for "environment" which define gpus and nodes, and paths
@@ -245,6 +280,15 @@ def task_finetune_mmimdb():
     weight_decay = 2e-2
 #     optim_type = "adam"
     max_text_len = 1024
+    # 【新增】模态生成器配置
+    modal_generator_config = {
+        'hidden_size': 512,
+        'num_layers': 3,
+        'num_heads': 8,
+        'dropout': 0.1
+    }
+    # 【新增】循环一致性损失权重
+    cycle_loss_weight = 0.02
 
 @ex.named_config
 def task_finetune_irtr_coco():

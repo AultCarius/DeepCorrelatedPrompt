@@ -1,0 +1,54 @@
+# 操作系统生成的文件
+.DS_Store
+Thumbs.db
+
+# 编辑器相关文件
+.idea/
+.vscode/
+
+# 虚拟环境
+venv/
+env/
+.conda/
+
+# 实验结果
+result/
+result_model_files/
+
+# 图片和可视化结果
+fig/
+
+# 数据集
+datasets/
+
+# 模型检查点和权重
+*.pth
+*.pt
+*.h5
+*.ckpt
+
+# TensorFlow 相关
+events.out.tfevents.*
+.graphviz
+
+# PyTorch 相关
+__pycache__/
+*.pyc
+
+# Jupyter Notebook 相关
+.ipynb_checkpoints/
+*.ipynb#
+*.swp
+
+# 日志文件
+logs/
+*.log
+
+# 环境配置
+.env
+.env.*
+!.env.example
+
+# 临时文件
+temp/
+tmp/

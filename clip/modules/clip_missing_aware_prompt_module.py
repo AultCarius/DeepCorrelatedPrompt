@@ -7,6 +7,15 @@ from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
 from clip.modules import clip_utils, heads, objectives, clip
 import copy
 
+#==========================================
+from .modal_generator import ModalGenerator
+import torch.nn.functional as F
+from .quality_estimator import QualityEstimator
+from .quality_guide_fusion import QualityGuidedFusion
+#====质量提示
+from .quality_aware_prompt import QualityAwarePromptLearner, IterativeQualityOptimization
+
+
 def load_clip_to_cpu(backbone_name, prompt_length, prompt_depth):
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
@@ -136,27 +145,156 @@ class MultiModalPromptLearner(nn.Module):
                     self.common_prompt_projection_text(common_prompt)]
                     ,0)
         # generate the prompts in each layer as a tensor [B, L, C]
+        # print("========")
+        # print(len(all_prompts_image))
+        # # 遍历每个样本的 prompts 并获取长度
+        # for i, prompts in enumerate(all_prompts_image):
+        #     num_prompts = len(prompts)  # 列表长度即 prompts 数量
+        #     print(f"样本 {i + 1} 的 prompts 数量：{num_prompts}")
+        #     print(prompts[0].shape)
         all_prompts_image = [torch.stack(prompts) for prompts in all_prompts_image]
         all_prompts_text = [torch.stack(prompts) for prompts in all_prompts_text]
+        # print(all_prompts_image)
         return all_prompts_image, all_prompts_text   
 
 class CustomCLIP(nn.Module):
     def __init__(self, prompt_length, prompt_depth, clip_model):
         super().__init__()
         self.prompt_learner = MultiModalPromptLearner(prompt_length, prompt_depth, clip_model)
+        # print("self.prompt_learner",self.prompt_learner)
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        # 【新增】模态生成器
+        self.modal_generator = ModalGenerator(
+            hidden_size=512,  # CLIP特征维度
+            num_layers=3,
+            num_heads=8,
+            dropout=0.1
+        )
+        # 【新增】质量评估器
+        self.quality_estimator = QualityEstimator(hidden_size=512)
+
+        # 【新增】质量引导融合器
+        self.quality_fusion = QualityGuidedFusion(
+            hidden_size=512,
+            fusion_strategy='adaptive_attention'  # 可配置
+        )
+
+        # 【新增】质量感知Prompt学习器
+        self.quality_prompt_learner = QualityAwarePromptLearner(
+            self.prompt_learner, prompt_length, prompt_depth
+        )
+
+        # 【新增】迭代优化器
+        self.iterative_optimizer = IterativeQualityOptimization({
+            'image_encoder': self.image_encoder,
+            'text_encoder': self.text_encoder,
+            'modal_generator': self.modal_generator,
+            'quality_estimator': self.quality_estimator,
+            'quality_fusion': self.quality_fusion,
+            'quality_prompt_learner': self.quality_prompt_learner
+        })
+
+        # 训练策略控制
+        self.use_iterative_optimization = True
+        self.use_quality_aware_prompts = True
+
 
     def forward(self, image, text, missing_type):
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(image.get_device()).squeeze(1)  # extract texts from the first key  # [b, 77]
-        #logit_scale = self.logit_scale.exp()
+        # #logit_scale = self.logit_scale.exp()
+        #
+        # all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
+        # text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+        # image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
+        #
+        # # 【新增】模态生成和特征增强
+        # enhanced_image_features, enhanced_text_features = self.modal_generator(
+        #     image_features, text_features, missing_type
+        # )
+        #
+        # # 【新增】保存原始特征用于循环损失
+        # self.last_image_features = image_features
+        # self.last_text_features = text_features
+        # # 3. 【新增】质量评估
+        # quality_scores = self.quality_estimator(
+        #     image_features, text_features,
+        #     enhanced_image_features, enhanced_text_features,
+        #     missing_type
+        # )
+        #
+        # # 4. 【新增】质量引导融合
+        # fused_features = self.quality_fusion(
+        #     image_features, text_features,
+        #     enhanced_image_features, enhanced_text_features,
+        #     quality_scores, missing_type
+        # )
+        # # 在质量评估后保存质量分数
+        # self.last_quality_scores = quality_scores
+        #
+        # # return torch.cat([image_features, text_features], -1)
+        # # 使用增强后的特征进行拼接
+        # # return torch.cat([enhanced_image_features, enhanced_text_features], -1)
+        # return fused_features
 
-        all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
-        text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
-        image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
-        return torch.cat([image_features, text_features], -1)
+        if self.use_iterative_optimization and self.training:
+            # 【新方法】迭代质量优化
+            fused_features, image_features, text_features = self.iterative_optimizer(
+                image, tokenized_texts, missing_type, tokenized_texts
+            )
+
+            # 保存特征用于损失计算
+            self.last_image_features = image_features
+            self.last_text_features = text_features
+
+        else:
+            # 【原方法】单次前向传播 (推理时使用)
+            if self.use_quality_aware_prompts:
+                # 两阶段方法: 先获取质量，再生成质量感知prompts
+
+                # 第一阶段: 基础编码获取初始质量
+                base_prompts_img, base_prompts_text = self.quality_prompt_learner(missing_type, None)
+
+                initial_image_features = self.image_encoder(image.type(self.dtype), base_prompts_img, missing_type)
+                initial_text_features = self.text_encoder(tokenized_texts, base_prompts_text, missing_type)
+
+                initial_enhanced_img, initial_enhanced_text = self.modal_generator(
+                    initial_image_features, initial_text_features, missing_type
+                )
+
+                initial_quality_scores = self.quality_estimator(
+                    initial_image_features, initial_text_features,
+                    initial_enhanced_img, initial_enhanced_text, missing_type
+                )
+
+                # 第二阶段: 使用质量感知prompts重新编码
+                quality_prompts_img, quality_prompts_text = self.quality_prompt_learner(
+                    missing_type, initial_quality_scores
+                )
+
+                image_features = self.image_encoder(image.type(self.dtype), quality_prompts_img, missing_type)
+                text_features = self.text_encoder(tokenized_texts, quality_prompts_text, missing_type)
+
+            else:
+                # 原始方法
+                all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
+                image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
+                text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+
+            # 保存特征
+            self.last_image_features = image_features
+            self.last_text_features = text_features
+
+            # 生成和融合
+            enhanced_image, enhanced_text = self.modal_generator(image_features, text_features, missing_type)
+            quality_scores = self.quality_estimator(image_features, text_features, enhanced_image, enhanced_text,
+                                                    missing_type)
+            fused_features = self.quality_fusion(image_features, text_features, enhanced_image, enhanced_text,
+                                                 quality_scores, missing_type)
+
+        return fused_features
 
 class CLIPransformerSS(pl.LightningModule):
     def __init__(self, config):
@@ -167,7 +305,18 @@ class CLIPransformerSS(pl.LightningModule):
 
         print("Building custom CLIP")
         hidden_size = 512*2
+        print(config['prompt_length'])
         self.model = CustomCLIP(config['prompt_length'], config['prompt_depth'], clip_model)
+
+        # 【新增】循环一致性损失权重
+        self.cycle_loss_weight = config.get('cycle_loss_weight', 0.02)
+        self.quality_loss_weight = config.get('quality_loss_weight', 0.01)  # 【新增】
+        # 【新增】训练策略控制
+        self.warmup_epochs = config.get('warmup_epochs', 5)
+        self.quality_aware_epochs = config.get('quality_aware_epochs', 10)
+
+        # 自适应损失权重调度器
+        self.loss_scheduler = self.create_loss_scheduler()
 
         # ===================== Downstream ===================== #
         if (
@@ -240,16 +389,20 @@ class CLIPransformerSS(pl.LightningModule):
             
             if self.hparams.config["loss_names"]["mmimdb"] > 0:
                 self.mmimdb_classifier.eval()
-        both_feats = self.model(img, text, batch["missing_type"])  
-        feature_dim = both_feats.shape[1]//2
+
+        # 获取增强后的特征
+        both_feats = self.model(img, text, batch["missing_type"])
+
+        # 处理缺失模态的掩码（保持原有逻辑）
+        feature_dim = both_feats.shape[1] // 2
         for idx in range(len(img)):
             if batch["missing_type"][idx] == 0:
-                pass       
+                pass
             elif batch["missing_type"][idx] == 1:  # missing text
                 both_feats[idx, feature_dim:].zero_()
-            elif batch["missing_type"][idx] == 2:
+            elif batch["missing_type"][idx] == 2:  # missing image
                 both_feats[idx, :feature_dim].zero_()
-            
+
         ret = {
             "cls_feats": both_feats,
         }
@@ -292,7 +445,50 @@ class CLIPransformerSS(pl.LightningModule):
         clip_utils.set_task(self)
         output = self(batch)
         total_loss = sum([v for k, v in output.items() if "loss" in k])
+        current_weights = self.get_current_loss_weights()
+        # 【新增】循环一致性损失
+        # if self.cycle_loss_weight > 0 and self.training:
+        #     # 从模型中获取刚刚保存的原始特征
+        #     if hasattr(self.model, 'last_image_features') and hasattr(self.model, 'last_text_features'):
+        #         cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
+        #             self.model.last_image_features,
+        #             self.model.last_text_features,
+        #             batch["missing_type"]
+        #         )
+        #         if cycle_loss is not None and cycle_loss > 0:
+        #             total_loss = total_loss + self.cycle_loss_weight * cycle_loss
+        #             self.log("train/cycle_loss", cycle_loss)
+        # # 【新增】质量监督损失
+        # if self.quality_loss_weight > 0 and self.training:
+        #     if hasattr(self.model, 'last_quality_scores'):
+        #         quality_loss = self.compute_quality_supervision_loss(
+        #             self.model.last_quality_scores, batch["missing_type"]
+        #         )
+        #         total_loss = total_loss + self.quality_loss_weight * quality_loss
+        #         self.log("train/quality_loss", quality_loss)
+        # 循环一致性损失
+        if current_weights['cycle'] > 0 and hasattr(self.model, 'last_image_features'):
+            cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
+                self.model.last_image_features,
+                self.model.last_text_features,
+                batch["missing_type"]
+            )
+            if cycle_loss is not None and cycle_loss > 0:
+                total_loss = total_loss + current_weights['cycle'] * cycle_loss
+                self.log("train/cycle_loss", cycle_loss)
+                self.log("train/cycle_weight", current_weights['cycle'])
 
+        # 质量监督损失
+        if current_weights['quality'] > 0 and hasattr(self.model, 'last_quality_scores'):
+            quality_loss = self.compute_quality_supervision_loss(
+                self.model.last_quality_scores, batch["missing_type"]
+            )
+            total_loss = total_loss + current_weights['quality'] * quality_loss
+            self.log("train/quality_loss", quality_loss)
+            self.log("train/quality_weight", current_weights['quality'])
+
+        # 记录训练阶段
+        self.log("train/training_stage", float(self.current_epoch))
         return total_loss
 
     def training_epoch_end(self, outs):
@@ -327,3 +523,91 @@ class CLIPransformerSS(pl.LightningModule):
 
     def configure_optimizers(self):
         return clip_utils.set_schedule(self)
+
+    def compute_quality_supervision_loss(self, quality_scores, missing_type):
+        """计算质量监督损失"""
+        if quality_scores is None:
+            return torch.tensor(0.0, requires_grad=True).to(self.device)
+
+        quality_loss = 0.0
+        count = 0
+
+        for i, mt in enumerate(missing_type):
+            sample_quality = quality_scores[i]
+
+            # 根据缺失类型设置目标质量
+            if mt == 0:  # 完整样本
+                target_confidence = 0.9
+                target_consistency = 0.8
+            else:  # 缺失样本
+                target_confidence = 0.6
+                target_consistency = 0.6
+
+            # 监督生成置信度
+            predicted_confidence = sample_quality['generation_confidence']
+            quality_loss += F.mse_loss(
+                predicted_confidence,
+                torch.tensor(target_confidence).to(predicted_confidence.device).expand_as(predicted_confidence)
+            )
+
+            # 监督跨模态一致性
+            predicted_consistency = sample_quality['cross_modal_consistency']
+            quality_loss += F.mse_loss(
+                predicted_consistency,
+                torch.tensor(target_consistency).to(predicted_consistency.device).expand_as(predicted_consistency)
+            )
+
+            count += 2
+
+        return quality_loss / max(count, 1)
+
+    def create_loss_scheduler(self):
+        """创建自适应损失调度器"""
+        return {
+            'warmup': {'cycle': 0.05, 'quality': 0.001},  # 前5轮: 重点训练生成器
+            'quality_aware': {'cycle': 0.02, 'quality': 0.01},  # 中期: 平衡训练
+            'full_optimization': {'cycle': 0.01, 'quality': 0.02}  # 后期: 重点质量
+        }
+
+    def get_current_loss_weights(self):
+        """根据当前epoch获取损失权重"""
+        current_epoch = self.current_epoch
+
+        if current_epoch < self.warmup_epochs:
+            return self.loss_scheduler['warmup']
+        elif current_epoch < self.warmup_epochs + self.quality_aware_epochs:
+            return self.loss_scheduler['quality_aware']
+        else:
+            return self.loss_scheduler['full_optimization']
+
+    def configure_model_for_epoch(self):
+        """根据训练阶段配置模型"""
+        current_epoch = self.current_epoch
+
+        if current_epoch < self.warmup_epochs:
+            # 阶段1: 只训练基础组件
+            self.model.use_iterative_optimization = False
+            self.model.use_quality_aware_prompts = False
+
+            # 冻结质量相关组件
+            for param in self.model.quality_estimator.parameters():
+                param.requires_grad = False
+            for param in self.model.quality_prompt_learner.parameters():
+                param.requires_grad = False
+
+        elif current_epoch < self.warmup_epochs + self.quality_aware_epochs:
+            # 阶段2: 启用质量感知但不迭代
+            self.model.use_iterative_optimization = False
+            self.model.use_quality_aware_prompts = True
+
+            # 解冻质量组件
+            for param in self.model.quality_estimator.parameters():
+                param.requires_grad = True
+            for param in self.model.quality_prompt_learner.parameters():
+                param.requires_grad = True
+
+        else:
+            # 阶段3: 完全启用所有功能
+            self.model.use_iterative_optimization = True
+            self.model.use_quality_aware_prompts = True
+
