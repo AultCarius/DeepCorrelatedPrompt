@@ -14,7 +14,8 @@ from .quality_estimator import QualityEstimator
 from .quality_guide_fusion import QualityGuidedFusion
 #====质量提示
 from .quality_aware_prompt import QualityAwarePromptLearner, IterativeQualityOptimization
-
+from .enhanced_quality_estimator import TaskRelevanceQualityEstimator,QualityAwareObjective
+from .quality_aware_attention import AttentionReweightingFusion, QualityAwareTaskLoss
 
 def load_clip_to_cpu(backbone_name, prompt_length, prompt_depth):
     url = clip._MODELS[backbone_name]
@@ -173,36 +174,50 @@ class CustomCLIP(nn.Module):
             num_heads=8,
             dropout=0.1
         )
-        # 【新增】质量评估器
-        self.quality_estimator = QualityEstimator(hidden_size=512)
-
-        # 【新增】质量引导融合器
-        self.quality_fusion = QualityGuidedFusion(
+        # # 【新增】质量评估器
+        # self.quality_estimator = QualityEstimator(hidden_size=512)
+        #
+        # # 【新增】质量引导融合器
+        # self.quality_fusion = QualityGuidedFusion(
+        #     hidden_size=512,
+        #     fusion_strategy='adaptive_attention'  # 可配置
+        # )
+        #
+        # # 【新增】质量感知Prompt学习器
+        # self.quality_prompt_learner = QualityAwarePromptLearner(
+        #     self.prompt_learner, prompt_length, prompt_depth
+        # )
+        #
+        # # 【新增】迭代优化器
+        # self.iterative_optimizer = IterativeQualityOptimization({
+        #     'image_encoder': self.image_encoder,
+        #     'text_encoder': self.text_encoder,
+        #     'modal_generator': self.modal_generator,
+        #     'quality_estimator': self.quality_estimator,
+        #     'quality_fusion': self.quality_fusion,
+        #     'quality_prompt_learner': self.quality_prompt_learner
+        # })
+        #
+        # # 训练策略控制
+        # self.use_iterative_optimization = True
+        # self.use_quality_aware_prompts = True
+        # 【新版】多维度质量评估器
+        self.quality_estimator = TaskRelevanceQualityEstimator(
             hidden_size=512,
-            fusion_strategy='adaptive_attention'  # 可配置
+            num_classes=23  # mmimdb类别数
         )
 
-        # 【新增】质量感知Prompt学习器
-        self.quality_prompt_learner = QualityAwarePromptLearner(
-            self.prompt_learner, prompt_length, prompt_depth
+        # 【新版】注意力重加权融合器
+        self.quality_fusion = AttentionReweightingFusion(
+            hidden_size=512,
+            fusion_strategy='quality_attention'
         )
 
-        # 【新增】迭代优化器
-        self.iterative_optimizer = IterativeQualityOptimization({
-            'image_encoder': self.image_encoder,
-            'text_encoder': self.text_encoder,
-            'modal_generator': self.modal_generator,
-            'quality_estimator': self.quality_estimator,
-            'quality_fusion': self.quality_fusion,
-            'quality_prompt_learner': self.quality_prompt_learner
-        })
-
-        # 训练策略控制
-        self.use_iterative_optimization = True
-        self.use_quality_aware_prompts = True
+        # 质量感知的训练损失
+        # self.quality_training_loss = QualityAwareTaskLoss()
 
 
-    def forward(self, image, text, missing_type):
+    def forward(self, image, text, missing_type,true_labels=None):
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(image.get_device()).squeeze(1)  # extract texts from the first key  # [b, 77]
         # #logit_scale = self.logit_scale.exp()
         #
@@ -239,60 +254,91 @@ class CustomCLIP(nn.Module):
         # # return torch.cat([enhanced_image_features, enhanced_text_features], -1)
         # return fused_features
 
-        if self.use_iterative_optimization and self.training:
-            # 【新方法】迭代质量优化
-            fused_features, image_features, text_features = self.iterative_optimizer(
-                image, tokenized_texts, missing_type, tokenized_texts
-            )
+        # if self.use_iterative_optimization and self.training:
+        #     # 【新方法】迭代质量优化
+        #     fused_features, image_features, text_features = self.iterative_optimizer(
+        #         image, tokenized_texts, missing_type, tokenized_texts
+        #     )
+        #
+        #     # 保存特征用于损失计算
+        #     self.last_image_features = image_features
+        #     self.last_text_features = text_features
+        #
+        # else:
+        #     # 【原方法】单次前向传播 (推理时使用)
+        #     if self.use_quality_aware_prompts:
+        #         # 两阶段方法: 先获取质量，再生成质量感知prompts
+        #
+        #         # 第一阶段: 基础编码获取初始质量
+        #         base_prompts_img, base_prompts_text = self.quality_prompt_learner(missing_type, None)
+        #
+        #         initial_image_features = self.image_encoder(image.type(self.dtype), base_prompts_img, missing_type)
+        #         initial_text_features = self.text_encoder(tokenized_texts, base_prompts_text, missing_type)
+        #
+        #         initial_enhanced_img, initial_enhanced_text = self.modal_generator(
+        #             initial_image_features, initial_text_features, missing_type
+        #         )
+        #
+        #         initial_quality_scores = self.quality_estimator(
+        #             initial_image_features, initial_text_features,
+        #             initial_enhanced_img, initial_enhanced_text, missing_type
+        #         )
+        #
+        #         # 第二阶段: 使用质量感知prompts重新编码
+        #         quality_prompts_img, quality_prompts_text = self.quality_prompt_learner(
+        #             missing_type, initial_quality_scores
+        #         )
+        #
+        #         image_features = self.image_encoder(image.type(self.dtype), quality_prompts_img, missing_type)
+        #         text_features = self.text_encoder(tokenized_texts, quality_prompts_text, missing_type)
+        #
+        #     else:
+        #         # 原始方法
+        #         all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
+        #         image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
+        #         text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+        #
+        #     # 保存特征
+        #     self.last_image_features = image_features
+        #     self.last_text_features = text_features
+        #
+        #     # 生成和融合
+        #     enhanced_image, enhanced_text = self.modal_generator(image_features, text_features, missing_type)
+        #     quality_scores = self.quality_estimator(image_features, text_features, enhanced_image, enhanced_text,
+        #                                             missing_type)
+        #     fused_features = self.quality_fusion(image_features, text_features, enhanced_image, enhanced_text,
+        #                                          quality_scores, missing_type)
+        # 1. 原有编码流程
+        all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
+        text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+        image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
 
-            # 保存特征用于损失计算
-            self.last_image_features = image_features
-            self.last_text_features = text_features
+        # 保存原始特征用于循环损失
+        self.last_image_features = image_features
+        self.last_text_features = text_features
 
-        else:
-            # 【原方法】单次前向传播 (推理时使用)
-            if self.use_quality_aware_prompts:
-                # 两阶段方法: 先获取质量，再生成质量感知prompts
+        # 2. 模态生成 (保持不变)
+        enhanced_image_features, enhanced_text_features = self.modal_generator(
+            image_features, text_features, missing_type
+        )
 
-                # 第一阶段: 基础编码获取初始质量
-                base_prompts_img, base_prompts_text = self.quality_prompt_learner(missing_type, None)
+        # 3. 【新版】多维度质量评估
+        quality_scores, task_logits = self.quality_estimator(
+            image_features, text_features,
+            enhanced_image_features, enhanced_text_features,
+            missing_type
+        )
 
-                initial_image_features = self.image_encoder(image.type(self.dtype), base_prompts_img, missing_type)
-                initial_text_features = self.text_encoder(tokenized_texts, base_prompts_text, missing_type)
+        # 保存质量分数和任务预测用于损失计算
+        self.last_quality_scores = quality_scores
+        self.last_task_logits = task_logits
 
-                initial_enhanced_img, initial_enhanced_text = self.modal_generator(
-                    initial_image_features, initial_text_features, missing_type
-                )
-
-                initial_quality_scores = self.quality_estimator(
-                    initial_image_features, initial_text_features,
-                    initial_enhanced_img, initial_enhanced_text, missing_type
-                )
-
-                # 第二阶段: 使用质量感知prompts重新编码
-                quality_prompts_img, quality_prompts_text = self.quality_prompt_learner(
-                    missing_type, initial_quality_scores
-                )
-
-                image_features = self.image_encoder(image.type(self.dtype), quality_prompts_img, missing_type)
-                text_features = self.text_encoder(tokenized_texts, quality_prompts_text, missing_type)
-
-            else:
-                # 原始方法
-                all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
-                image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
-                text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
-
-            # 保存特征
-            self.last_image_features = image_features
-            self.last_text_features = text_features
-
-            # 生成和融合
-            enhanced_image, enhanced_text = self.modal_generator(image_features, text_features, missing_type)
-            quality_scores = self.quality_estimator(image_features, text_features, enhanced_image, enhanced_text,
-                                                    missing_type)
-            fused_features = self.quality_fusion(image_features, text_features, enhanced_image, enhanced_text,
-                                                 quality_scores, missing_type)
+        # 4. 【新版】注意力重加权融合
+        fused_features = self.quality_fusion(
+            image_features, text_features,
+            enhanced_image_features, enhanced_text_features,
+            quality_scores, missing_type
+        )
 
         return fused_features
 
@@ -308,15 +354,24 @@ class CLIPransformerSS(pl.LightningModule):
         print(config['prompt_length'])
         self.model = CustomCLIP(config['prompt_length'], config['prompt_depth'], clip_model)
 
-        # 【新增】循环一致性损失权重
+        # 损失权重
         self.cycle_loss_weight = config.get('cycle_loss_weight', 0.02)
-        self.quality_loss_weight = config.get('quality_loss_weight', 0.01)  # 【新增】
-        # 【新增】训练策略控制
-        self.warmup_epochs = config.get('warmup_epochs', 5)
-        self.quality_aware_epochs = config.get('quality_aware_epochs', 10)
+        self.quality_loss_weight = config.get('quality_loss_weight', 0.01)
+        self.task_auxiliary_weight = config.get('task_auxiliary_weight', 0.1)  # 【新增】任务辅助损失权重
 
-        # 自适应损失权重调度器
-        self.loss_scheduler = self.create_loss_scheduler()
+        # 质量感知的任务损失
+        # 质量感知的任务损失
+        self.quality_task_loss = QualityAwareTaskLoss(
+            importance_weight=0.3,
+            difficulty_weight=0.4,
+            authenticity_weight=0.3
+        )
+
+        # 下游任务分类器修改为使用质量感知损失
+        if self.hparams.config["loss_names"]["mmimdb"] > 0:
+            cls_num = self.hparams.config["mmimdb_class_num"]
+            self.mmimdb_classifier = nn.Linear(hidden_size, cls_num)
+            self.mmimdb_classifier.apply(objectives.init_weights)
 
         # ===================== Downstream ===================== #
         if (
@@ -391,7 +446,7 @@ class CLIPransformerSS(pl.LightningModule):
                 self.mmimdb_classifier.eval()
 
         # 获取增强后的特征
-        both_feats = self.model(img, text, batch["missing_type"])
+        both_feats = self.model(img, text, batch["missing_type"],None)
 
         # 处理缺失模态的掩码（保持原有逻辑）
         feature_dim = both_feats.shape[1] // 2
@@ -429,8 +484,9 @@ class CLIPransformerSS(pl.LightningModule):
             
         # Binary classification for Hateful Memes
         if "hatememes" in self.current_tasks:
-            ret.update(objectives.compute_hatememes(self, batch))
-            
+            # ret.update(objectives.compute_hatememes(self, batch))
+            ret.update(objectives.compute_enhanced_mmimdb(self, batch))
+
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
             ret.update(objectives.compute_mmimdb(self, batch))
@@ -445,7 +501,7 @@ class CLIPransformerSS(pl.LightningModule):
         clip_utils.set_task(self)
         output = self(batch)
         total_loss = sum([v for k, v in output.items() if "loss" in k])
-        current_weights = self.get_current_loss_weights()
+        # current_weights = self.get_current_loss_weights()
         # 【新增】循环一致性损失
         # if self.cycle_loss_weight > 0 and self.training:
         #     # 从模型中获取刚刚保存的原始特征
@@ -466,29 +522,18 @@ class CLIPransformerSS(pl.LightningModule):
         #         )
         #         total_loss = total_loss + self.quality_loss_weight * quality_loss
         #         self.log("train/quality_loss", quality_loss)
-        # 循环一致性损失
-        if current_weights['cycle'] > 0 and hasattr(self.model, 'last_image_features'):
-            cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
-                self.model.last_image_features,
-                self.model.last_text_features,
-                batch["missing_type"]
-            )
-            if cycle_loss is not None and cycle_loss > 0:
-                total_loss = total_loss + current_weights['cycle'] * cycle_loss
-                self.log("train/cycle_loss", cycle_loss)
-                self.log("train/cycle_weight", current_weights['cycle'])
+        # 循环一致性损失 (保持不变)
+        if self.cycle_loss_weight > 0 and self.training:
+            if hasattr(self.model, 'last_image_features') and hasattr(self.model, 'last_text_features'):
+                cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
+                    self.model.last_image_features,
+                    self.model.last_text_features,
+                    batch["missing_type"]
+                )
+                if cycle_loss is not None and cycle_loss > 0:
+                    total_loss = total_loss + self.cycle_loss_weight * cycle_loss
+                    self.log("train/cycle_loss", cycle_loss)
 
-        # 质量监督损失
-        if current_weights['quality'] > 0 and hasattr(self.model, 'last_quality_scores'):
-            quality_loss = self.compute_quality_supervision_loss(
-                self.model.last_quality_scores, batch["missing_type"]
-            )
-            total_loss = total_loss + current_weights['quality'] * quality_loss
-            self.log("train/quality_loss", quality_loss)
-            self.log("train/quality_weight", current_weights['quality'])
-
-        # 记录训练阶段
-        self.log("train/training_stage", float(self.current_epoch))
         return total_loss
 
     def training_epoch_end(self, outs):

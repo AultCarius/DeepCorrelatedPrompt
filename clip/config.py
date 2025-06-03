@@ -110,11 +110,34 @@ def config():
     }
 
     # 【新增】循环一致性损失权重 - 必须在主config中定义
-    cycle_loss_weight = 0.02
+    # cycle_loss_weight = 0.02
     # 【新增】质量评估配置
     quality_estimator_config = {
         'hidden_size': 512,
         'fusion_strategy': 'weighted'  # 'weighted' 或 'attention'
+    }
+
+    # 【更新】损失权重配置
+    cycle_loss_weight = 0.02  # 循环一致性损失权重
+    quality_loss_weight = 0.01  # 质量一致性损失权重
+    task_auxiliary_weight = 0.1  # 【新增】任务辅助损失权重
+
+    # 【新增】多维度质量评估配置
+    enhanced_quality_config = {
+        'use_geometric_quality': True,  # 几何质量评估
+        'use_information_quality': True,  # 信息论质量评估
+        'use_task_quality': True,  # 任务相关质量评估
+        'use_contrastive_quality': True,  # 对比学习质量评估
+        'use_mathematical_quality': True,  # 数学质量评估
+        'fusion_strategy': 'quality_attention'  # 融合策略
+    }
+
+    # 【新增】合理质量评估配置
+    reasonable_quality_config = {
+        'importance_weight': 0.1,  # 模态重要性损失权重
+        'authenticity_weight': 0.05,  # 特征真实性损失权重
+        'difficulty_weight': 0.05,  # 任务难度损失权重
+        'use_quality_fusion': True,  # 是否使用质量引导融合
     }
 
     # 【新增】质量监督损失权重

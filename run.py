@@ -42,6 +42,13 @@ def main(_config):
         os.makedirs(target_dir)
     shutil.copy2('./clip/modules/clip_missing_aware_prompt_module.py', target_dir)
     shutil.copy2('./clip/modules/vision_transformer_prompts.py', target_dir)
+    shutil.copy2('./clip/modules/quality_aware_attention.py', target_dir)
+    shutil.copy2('./clip/modules/quality_estimator.py', target_dir)
+    shutil.copy2('./clip/modules/quality_aware_prompt.py', target_dir)
+    shutil.copy2('./clip/modules/quality_guide_fusion.py', target_dir)
+    shutil.copy2('./clip/modules/enhanced_quality_estimator.py', target_dir)
+    shutil.copy2('./clip/modules/modal_generator.py', target_dir)
+    shutil.copy2('./clip/modules/objectives.py', target_dir)
     shutil.copy2('./clip/config.py', target_dir)
 
     lr_callback = pl.callbacks.LearningRateMonitor(logging_interval="step")

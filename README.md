@@ -82,3 +82,4 @@ This code is based on [ViLT](https://github.com/dandelin/ViLT.git), [CLIP](https
 python run.py with data_root=datasets num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb exp_name=exp_base
 
 ```
+python run.py with data_root=/root/autodl-tmp/mmimdb num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=result/exp_mmimdb_both_0.7_1_seed0/version_0/checkpoints/epoch=3-step=481.ckpt test_only=True test_ratio=0.7 test_type=both exp_name=exp_test

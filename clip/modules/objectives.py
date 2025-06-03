@@ -333,6 +333,95 @@ def compute_hatememes(pl_module, batch):
 
     return ret
 
+
+def compute_enhanced_mmimdb(pl_module, batch):
+    """增强的MM-IMDb计算，集成质量感知目标"""
+    phase = "train" if pl_module.training else "val"
+
+    # 1. 标准推理流程 (不传入标签，避免信息泄露)
+    infer = pl_module.infer(batch)
+
+    # 2. 任务预测
+    imgcls_logits = pl_module.mmimdb_classifier(infer["cls_feats"])
+    imgcls_labels = batch["label"]
+    imgcls_labels = torch.tensor(imgcls_labels).to(pl_module.device).float()
+
+    # 3. 基础任务损失
+    base_task_loss = F.binary_cross_entropy_with_logits(imgcls_logits, imgcls_labels)
+
+    # 4. 质量感知的监督学习 (只在训练时进行)
+    total_loss = base_task_loss
+    quality_loss_components = {}
+    from .enhanced_quality_estimator import QualityAwareObjective
+
+    if pl_module.training and hasattr(pl_module.model, 'last_quality_predictions'):
+        # 获取质量评估器的预测结果
+        quality_predictions = pl_module.model.last_quality_predictions
+
+        # 获取原始特征
+        if hasattr(pl_module.model, 'last_image_features') and hasattr(pl_module.model, 'last_text_features'):
+            # 计算质量监督损失
+            quality_objective = QualityAwareObjective(
+                importance_weight=0.1,
+                authenticity_weight=0.05,
+                difficulty_weight=0.05
+            )
+
+            quality_loss_dict = quality_objective(
+                quality_predictions,
+                pl_module.model.last_image_features,
+                pl_module.model.last_text_features,
+                batch["missing_type"],
+                imgcls_logits,
+                imgcls_labels
+            )
+
+            # 添加质量监督损失
+            total_loss = total_loss + quality_loss_dict['quality_supervision_loss']
+            quality_loss_components = quality_loss_dict
+
+    # 5. 构建返回结果
+    ret = {
+        "mmimdb_loss": total_loss,
+        "mmimdb_base_loss": base_task_loss,  # 基础任务损失
+        "mmimdb_logits": imgcls_logits,
+        "mmimdb_labels": imgcls_labels,
+    }
+
+    # 添加质量损失组件
+    for key, value in quality_loss_components.items():
+        ret[f"mmimdb_{key}"] = value
+
+    # 6. 记录指标
+    loss = getattr(pl_module, f"{phase}_mmimdb_loss")(ret["mmimdb_loss"])
+    f1_scores = getattr(pl_module, f"{phase}_mmimdb_F1_scores")(
+        ret["mmimdb_logits"], ret["mmimdb_labels"]
+    )
+    pl_module.log(f"mmimdb/{phase}/loss", loss)
+
+    # 记录质量相关指标
+    if pl_module.training and quality_loss_components:
+        pl_module.log("mmimdb/train/base_loss", base_task_loss)
+        pl_module.log("mmimdb/train/importance_loss", quality_loss_components['importance_loss'])
+        pl_module.log("mmimdb/train/difficulty_loss", quality_loss_components['difficulty_loss'])
+        pl_module.log("mmimdb/train/authenticity_loss", quality_loss_components['authenticity_loss'])
+
+        # 记录质量预测的平均值 (用于监控)
+        if hasattr(pl_module.model, 'last_quality_scores'):
+            avg_img_importance = torch.stack(
+                [q['predicted_image_importance'] for q in pl_module.model.last_quality_scores]).mean()
+            avg_text_importance = torch.stack(
+                [q['predicted_text_importance'] for q in pl_module.model.last_quality_scores]).mean()
+            avg_task_difficulty = torch.stack(
+                [q['predicted_task_difficulty'] for q in pl_module.model.last_quality_scores]).mean()
+
+            pl_module.log("quality/avg_image_importance", avg_img_importance)
+            pl_module.log("quality/avg_text_importance", avg_text_importance)
+            pl_module.log("quality/avg_task_difficulty", avg_task_difficulty)
+
+    return ret
+
+
 def compute_food101(pl_module, batch):
     phase = "train" if pl_module.training else "val"
     if phase == "train":
