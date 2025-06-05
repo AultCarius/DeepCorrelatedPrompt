@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -334,92 +335,210 @@ def compute_hatememes(pl_module, batch):
     return ret
 
 
+# clip/modules/objectives.py 中新增的质量感知损失函数
+
+def compute_objective_quality_loss(quality_scores, image_features, text_features,
+                                   enhanced_image_features, enhanced_text_features,
+                                   missing_type, current_task_performance):
+    """
+    更新版：适配新的质量分数结构。
+    """
+
+    task_correlation_loss = 0.0
+    if current_task_performance is not None:
+        for i, quality in enumerate(quality_scores):
+            # 新的质量结构下，我们使用 image 和 text 的 task_contribution + cross_modal_consistency 来表示整体质量
+            overall_quality = (
+                quality['image_quality']['task_contribution'] +
+                quality['text_quality']['task_contribution'] +
+                quality['cross_modal_consistency']
+            ) / 3
+
+            task_correlation_loss += F.relu(0.1 - overall_quality * current_task_performance[i])
+
+    consistency_loss = 0.0
+    for quality in quality_scores:
+        # 图像表示质量高 → 图像内在质量也应高
+        consistency_loss += F.relu(
+            quality['image_quality']['representation_quality'] -
+            quality['image_quality']['intrinsic_quality'] - 0.2
+        )
+
+        # 文本表示质量高 → 文本内在质量也应高
+        consistency_loss += F.relu(
+            quality['text_quality']['representation_quality'] -
+            quality['text_quality']['intrinsic_quality'] - 0.2
+        )
+
+        # 图文模态的一致性高 → 图像和文本的生成置信度也应高
+        consistency_loss += F.relu(
+            quality['cross_modal_consistency'] -
+            quality['image_quality']['generation_confidence'] - 0.1
+        )
+        consistency_loss += F.relu(
+            quality['cross_modal_consistency'] -
+            quality['text_quality']['generation_confidence'] - 0.1
+        )
+
+    physics_loss = 0.0
+    batch_size = len(quality_scores)
+    if batch_size > 1:
+        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
+        missing_indices = [i for i, mt in enumerate(missing_type) if mt != 0]
+
+        if len(complete_indices) > 0 and len(missing_indices) > 0:
+            complete_qualities = torch.stack([
+                (quality_scores[i]['image_quality']['intrinsic_quality'] +
+                 quality_scores[i]['text_quality']['intrinsic_quality'] +
+                 quality_scores[i]['cross_modal_consistency']) / 3
+                for i in complete_indices
+            ])
+            missing_qualities = torch.stack([
+                (quality_scores[i]['image_quality']['intrinsic_quality'] +
+                 quality_scores[i]['text_quality']['intrinsic_quality'] +
+                 quality_scores[i]['cross_modal_consistency']) / 3
+                for i in missing_indices
+            ])
+            physics_loss += F.relu(missing_qualities.mean() - complete_qualities.mean() + 0.1)
+
+    distance_consistency_loss = 0.0
+    for i, quality in enumerate(quality_scores):
+        if missing_type[i] == 1:  # 缺失文本
+            text_distance = F.mse_loss(text_features[i], enhanced_text_features[i])
+            confidence = quality['text_quality']['generation_confidence']
+            distance_consistency_loss += F.mse_loss(1.0 - text_distance, confidence)
+
+        elif missing_type[i] == 2:  # 缺失图像
+            img_distance = F.mse_loss(image_features[i], enhanced_image_features[i])
+            confidence = quality['image_quality']['generation_confidence']
+            distance_consistency_loss += F.mse_loss(1.0 - img_distance, confidence)
+
+    info_theory_loss = 0.0
+    for quality in quality_scores:
+        uncertainty = quality['overall_uncertainty']
+        consistency = quality['cross_modal_consistency']
+        contradiction_penalty = uncertainty * consistency
+        info_theory_loss += contradiction_penalty
+
+    total_quality_loss = (
+        0.3 * task_correlation_loss +
+        0.25 * consistency_loss +
+        0.2 * physics_loss +
+        0.15 * distance_consistency_loss +
+        0.1 * info_theory_loss
+    ) / max(len(quality_scores), 1)
+
+    return total_quality_loss
+
+
+
+def extract_task_performance_mmimdb(mmimdb_logits, mmimdb_labels):
+    """
+    从MMIMDb任务输出中提取性能指标
+    """
+    if mmimdb_logits is None:
+        return None
+
+    with torch.no_grad():
+        # 计算预测置信度作为性能指标
+        probs = torch.sigmoid(mmimdb_logits)
+
+        # 方法1：最高预测概率的平均值
+        max_probs = torch.max(probs, dim=-1)[0]
+
+        # 方法2：预测分布的熵（低熵=高确定性=高性能）
+        eps = 1e-8
+        entropy = -torch.sum(probs * torch.log(probs + eps) +
+                             (1 - probs) * torch.log(1 - probs + eps), dim=-1)
+        normalized_entropy = entropy / (23 * np.log(2))  # 23个类别
+        certainty = 1.0 - normalized_entropy
+
+        # 结合两个指标
+        performance_score = 0.6 * max_probs + 0.4 * certainty
+
+    return performance_score.clamp(0.1, 0.9)
+
+
 def compute_enhanced_mmimdb(pl_module, batch):
-    """增强的MM-IMDb计算，集成质量感知目标"""
+    """
+    增强版的MMIMDb计算，集成质量感知损失
+    """
     phase = "train" if pl_module.training else "val"
 
-    # 1. 标准推理流程 (不传入标签，避免信息泄露)
-    infer = pl_module.infer(batch)
+    # 1. 标准的MMIMDb前向传播
+    if phase == "train":
+        infer = pl_module.infer(batch)
+    else:
+        infer = pl_module.infer(batch)
 
-    # 2. 任务预测
     imgcls_logits = pl_module.mmimdb_classifier(infer["cls_feats"])
     imgcls_labels = batch["label"]
     imgcls_labels = torch.tensor(imgcls_labels).to(pl_module.device).float()
 
-    # 3. 基础任务损失
-    base_task_loss = F.binary_cross_entropy_with_logits(imgcls_logits, imgcls_labels)
+    # 2. 主要的分类损失
+    mmimdb_loss = F.binary_cross_entropy_with_logits(imgcls_logits, imgcls_labels)
 
-    # 4. 质量感知的监督学习 (只在训练时进行)
-    total_loss = base_task_loss
-    quality_loss_components = {}
-    from .enhanced_quality_estimator import QualityAwareObjective
+    # 3. 【新增】质量感知损失
+    quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
 
-    if pl_module.training and hasattr(pl_module.model, 'last_quality_predictions'):
-        # 获取质量评估器的预测结果
-        quality_predictions = pl_module.model.last_quality_predictions
+    if (hasattr(pl_module.model, 'last_quality_scores') and
+            pl_module.model.last_quality_scores and
+            phase == "train"):  # 只在训练时计算质量损失
 
-        # 获取原始特征
-        if hasattr(pl_module.model, 'last_image_features') and hasattr(pl_module.model, 'last_text_features'):
-            # 计算质量监督损失
-            quality_objective = QualityAwareObjective(
-                importance_weight=0.1,
-                authenticity_weight=0.05,
-                difficulty_weight=0.05
-            )
+        # 提取任务性能指标
+        task_performance = extract_task_performance_mmimdb(imgcls_logits, imgcls_labels)
 
-            quality_loss_dict = quality_objective(
-                quality_predictions,
-                pl_module.model.last_image_features,
-                pl_module.model.last_text_features,
-                batch["missing_type"],
-                imgcls_logits,
-                imgcls_labels
-            )
+        # 获取必要的特征（需要在model中保存）
+        image_features = getattr(pl_module.model, 'last_image_features', None)
+        text_features = getattr(pl_module.model, 'last_text_features', None)
+        enhanced_image = getattr(pl_module.model, 'last_enhanced_image_features', None)
+        enhanced_text = getattr(pl_module.model, 'last_enhanced_text_features', None)
 
-            # 添加质量监督损失
-            total_loss = total_loss + quality_loss_dict['quality_supervision_loss']
-            quality_loss_components = quality_loss_dict
+        # 计算质量损失
+        quality_loss = compute_objective_quality_loss(
+            quality_scores=pl_module.model.last_quality_scores,
+            current_task_performance=task_performance,
+            image_features=image_features,
+            text_features=text_features,
+            enhanced_image_features=enhanced_image,
+            enhanced_text_features=enhanced_text,
+            missing_type=batch["missing_type"]
+        )
 
-    # 5. 构建返回结果
+    # 4. 返回结果
     ret = {
-        "mmimdb_loss": total_loss,
-        "mmimdb_base_loss": base_task_loss,  # 基础任务损失
+        "mmimdb_loss": mmimdb_loss,
+        "mmimdb_quality_loss": quality_loss,  # 单独记录质量损失
         "mmimdb_logits": imgcls_logits,
         "mmimdb_labels": imgcls_labels,
     }
 
-    # 添加质量损失组件
-    for key, value in quality_loss_components.items():
-        ret[f"mmimdb_{key}"] = value
-
-    # 6. 记录指标
+    # 5. 记录指标
     loss = getattr(pl_module, f"{phase}_mmimdb_loss")(ret["mmimdb_loss"])
+
+    # 记录质量损失
+    if quality_loss.item() > 0:
+        pl_module.log(f"mmimdb/{phase}/quality_loss", quality_loss)
+
     f1_scores = getattr(pl_module, f"{phase}_mmimdb_F1_scores")(
         ret["mmimdb_logits"], ret["mmimdb_labels"]
     )
     pl_module.log(f"mmimdb/{phase}/loss", loss)
 
-    # 记录质量相关指标
-    if pl_module.training and quality_loss_components:
-        pl_module.log("mmimdb/train/base_loss", base_task_loss)
-        pl_module.log("mmimdb/train/importance_loss", quality_loss_components['importance_loss'])
-        pl_module.log("mmimdb/train/difficulty_loss", quality_loss_components['difficulty_loss'])
-        pl_module.log("mmimdb/train/authenticity_loss", quality_loss_components['authenticity_loss'])
-
-        # 记录质量预测的平均值 (用于监控)
-        if hasattr(pl_module.model, 'last_quality_scores'):
-            avg_img_importance = torch.stack(
-                [q['predicted_image_importance'] for q in pl_module.model.last_quality_scores]).mean()
-            avg_text_importance = torch.stack(
-                [q['predicted_text_importance'] for q in pl_module.model.last_quality_scores]).mean()
-            avg_task_difficulty = torch.stack(
-                [q['predicted_task_difficulty'] for q in pl_module.model.last_quality_scores]).mean()
-
-            pl_module.log("quality/avg_image_importance", avg_img_importance)
-            pl_module.log("quality/avg_text_importance", avg_text_importance)
-            pl_module.log("quality/avg_task_difficulty", avg_task_difficulty)
-
     return ret
+
+
+# 同样的方式可以为其他任务实现
+def compute_enhanced_hatememes(pl_module, batch):
+    """类似的增强版HateMemes计算"""
+    # ... 类似实现
+    pass
+
+
+def compute_enhanced_food101(pl_module, batch):
+    """类似的增强版Food101计算"""
+    # ... 类似实现
+    pass
 
 
 def compute_food101(pl_module, batch):

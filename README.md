@@ -83,3 +83,10 @@ python run.py with data_root=datasets num_gpus=1 num_nodes=1 per_gpu_batchsize=4
 
 ```
 python run.py with data_root=/root/autodl-tmp/mmimdb num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=result/exp_mmimdb_both_0.7_1_seed0/version_0/checkpoints/epoch=3-step=481.ckpt test_only=True test_ratio=0.7 test_type=both exp_name=exp_test
+
+python run.py with data_root=datasets num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=result/exp_mmimdb_image_0.7_applyqualityprompt_seed0/version_0/checkpoints/epoch=5-step=685.ckpt test_only=True test_ratio=0.7 test_type=image exp_name=exp_test_mmimdb_text_0.7_applyquality
+
+python run.py with data_root=datasets num_gpus=1 num_nodes=1 per_gpu_batchsize=4 task_finetune_mmimdb load_path=result/exp_mmimdb_both_0.7_applyqualityprompt_seed0/version_1/checkpoints/epoch=4-step=558.ckpt test_only=True test_ratio=0.7 test_type=both exp_name=exp_test_mmimdb_both_0.7_applyquality
+
+
+
