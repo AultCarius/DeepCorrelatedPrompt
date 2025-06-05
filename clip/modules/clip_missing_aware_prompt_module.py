@@ -415,7 +415,9 @@ class CLIPransformerSS(pl.LightningModule):
 
         # 质量损失（已经在各个任务中计算）
         quality_loss = sum([v for k, v in output.items() if "quality_loss" in k])
+
         current_weights = self.get_current_loss_weights()
+        cycle_loss = 0.0
         total_loss = main_loss + self.quality_loss_weight * quality_loss
         # 循环一致性损失
         if current_weights['cycle'] > 0 and hasattr(self.model, 'last_image_features'):
@@ -428,6 +430,13 @@ class CLIPransformerSS(pl.LightningModule):
                 total_loss = total_loss + current_weights['cycle'] * cycle_loss
                 self.log("train/cycle_loss", cycle_loss)
                 self.log("train/cycle_weight", current_weights['cycle'])
+
+
+        if not torch.isfinite(total_loss):
+            print("[NaN Detect] total_loss is NaN")
+            print("main_loss =", main_loss)
+            print("quality_loss =", quality_loss)
+            print("cycle_loss =", cycle_loss)
 
         # 记录训练阶段
         self.log("train/training_stage", float(self.current_epoch))

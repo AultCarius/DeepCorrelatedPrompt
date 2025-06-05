@@ -344,6 +344,17 @@ def compute_objective_quality_loss(quality_scores, image_features, text_features
     更新版：适配新的质量分数结构。
     """
 
+    for q in quality_scores:
+        for k1 in ['image_quality', 'text_quality']:
+            for k2 in ['task_contribution', 'representation_quality', 'intrinsic_quality', 'generation_confidence']:
+                v = q[k1][k2]
+                if not torch.isfinite(v):
+                    print(f"[NaN Detect] {k1}.{k2} = {v}")
+        if not torch.isfinite(q['cross_modal_consistency']):
+            print(f"[NaN Detect] cross_modal_consistency = {q['cross_modal_consistency']}")
+        if 'overall_uncertainty' in q and not torch.isfinite(q['overall_uncertainty']):
+            print(f"[NaN Detect] overall_uncertainty = {q['overall_uncertainty']}")
+
     task_correlation_loss = 0.0
     if current_task_performance is not None:
         for i, quality in enumerate(quality_scores):
@@ -455,6 +466,9 @@ def extract_task_performance_mmimdb(mmimdb_logits, mmimdb_labels):
 
         # 结合两个指标
         performance_score = 0.6 * max_probs + 0.4 * certainty
+
+    if not torch.isfinite(performance_score).all():
+        print("[NaN Detect] performance_score contains NaN:", performance_score)
 
     return performance_score.clamp(0.1, 0.9)
 
