@@ -26,7 +26,7 @@ def _loss_names(d):
 @ex.config
 def config():
     exp_name = "exp"
-    seed = 0
+    seed = 42
     datasets = ["coco", "vg", "sbu", "gcc"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
     batch_size = 4096  # this is a desired batch size; pl trainer will accumulate gradients when per step batch is smaller.
