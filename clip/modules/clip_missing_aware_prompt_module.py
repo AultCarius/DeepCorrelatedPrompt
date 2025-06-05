@@ -190,7 +190,6 @@ class CustomCLIP(nn.Module):
         )
         # 【新增】质量评估器
         self.quality_estimator = QualityEstimator(hidden_size=512)
-
         # 【新增】质量引导融合器
         self.quality_fusion = QualityGuidedFusion(
             hidden_size=512,
@@ -215,16 +214,17 @@ class CustomCLIP(nn.Module):
         # 训练策略控制
         self.use_iterative_optimization = True
         self.use_quality_aware_prompts = True
+
         #========================================
         # 【第一步新增】客观质量评估器
         from .quality_estimator import ObjectiveQualityAssessor
         self.objective_quality_assessor = ObjectiveQualityAssessor(hidden_size=512)
 
 
-
     def forward(self, image, text, missing_type):
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(
             image.get_device()).squeeze(1)  # extract texts from the first key  # [b, 77]
+
         # 1. 基础编码
         all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
         text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
@@ -256,6 +256,7 @@ class CustomCLIP(nn.Module):
             enhanced_image_features, enhanced_text_features,
             quality_scores, missing_type
         )
+
 
         return fused_features
 
@@ -398,8 +399,10 @@ class CLIPransformerSS(pl.LightningModule):
 
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
+
             # ret.update(objectives.compute_mmimdb(self, batch))
             ret.update(objectives.compute_enhanced_mmimdb(self, batch))
+
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -410,6 +413,7 @@ class CLIPransformerSS(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         clip_utils.set_task(self)
         output = self(batch)
+
         # 主任务损失
         main_loss = sum([v for k, v in output.items() if "loss" in k and "quality" not in k])
 
@@ -417,6 +421,7 @@ class CLIPransformerSS(pl.LightningModule):
         quality_loss = sum([v for k, v in output.items() if "quality_loss" in k])
         current_weights = self.get_current_loss_weights()
         total_loss = main_loss + self.quality_loss_weight * quality_loss
+
         # 循环一致性损失
         if current_weights['cycle'] > 0 and hasattr(self.model, 'last_image_features'):
             cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
@@ -428,6 +433,7 @@ class CLIPransformerSS(pl.LightningModule):
                 total_loss = total_loss + current_weights['cycle'] * cycle_loss
                 self.log("train/cycle_loss", cycle_loss)
                 self.log("train/cycle_weight", current_weights['cycle'])
+
 
         # 记录训练阶段
         self.log("train/training_stage", float(self.current_epoch))
@@ -542,7 +548,6 @@ class CLIPransformerSS(pl.LightningModule):
             # 阶段3: 完全启用所有功能
             self.model.use_iterative_optimization = True
             self.model.use_quality_aware_prompts = True
-
 
 def compute_objective_quality_loss(quality_scores, image_features, text_features,
                                    enhanced_image_features, enhanced_text_features,
@@ -677,3 +682,4 @@ def extract_current_task_performance(model_output, batch, task_name):
             return certainty.detach()
 
     return None
+
