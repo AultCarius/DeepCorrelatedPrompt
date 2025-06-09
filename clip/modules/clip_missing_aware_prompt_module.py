@@ -162,13 +162,7 @@ class MultiModalPromptLearner(nn.Module):
                 self.common_prompt_projection_text(common_prompt)]
                 , 0)
         # generate the prompts in each layer as a tensor [B, L, C]
-        # print("========")
-        # print(len(all_prompts_image))
-        # # 遍历每个样本的 prompts 并获取长度
-        # for i, prompts in enumerate(all_prompts_image):
-        #     num_prompts = len(prompts)  # 列表长度即 prompts 数量
-        #     print(f"样本 {i + 1} 的 prompts 数量：{num_prompts}")
-        #     print(prompts[0].shape)
+
         all_prompts_image = [torch.stack(prompts) for prompts in all_prompts_image]
         all_prompts_text = [torch.stack(prompts) for prompts in all_prompts_text]
         # print(all_prompts_image)
@@ -207,6 +201,7 @@ class CustomCLIP(nn.Module):
         self.use_iterative_optimization = True
         self.use_quality_aware_prompts = True
 
+
         # 训练控制参数
         self.use_enhanced_quality = True  # 是否使用新的质量评估
         self.use_quality_aware_prompts = False  # 是否使用质量感知prompt
@@ -226,7 +221,7 @@ class CustomCLIP(nn.Module):
             # 简化的前向，只做特征编码，不涉及prompt
             return torch.cat([img_feat, text_feat], dim=-1)
         return task_forward_fn
-
+      
     def forward(self, image, text, missing_type):
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(
             image.get_device()).squeeze(1)  # extract texts from the first key  # [b, 77]
@@ -291,6 +286,7 @@ class CustomCLIP(nn.Module):
             'enhanced_text_features': enhanced_text_features,
             'fused_features': fused_features
         }
+
 
         return fused_features
 
@@ -436,9 +432,11 @@ class CLIPransformerSS(pl.LightningModule):
 
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
+
             # ret.update(objectives.compute_mmimdb(self, batch))
             # ret.update(objectives.compute_enhanced_mmimdb(self, batch))
             ret.update(objectives.compute_enhanced_mmimdb_v2(self, batch))
+
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -449,6 +447,7 @@ class CLIPransformerSS(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         clip_utils.set_task(self)
         output = self(batch)
+
         # 主任务损失
         main_loss = sum([v for k, v in output.items() if "loss" in k and "quality" not in k and "predictor" not in k])
 
@@ -559,6 +558,7 @@ class CLIPransformerSS(pl.LightningModule):
             self.model.use_iterative_optimization = True
             self.model.use_quality_aware_prompts = True
 
+
     def compute_quality_losses(self):
         """计算质量相关的损失"""
         total_quality_loss = 0.0
@@ -570,6 +570,7 @@ class CLIPransformerSS(pl.LightningModule):
                 predictor_loss = quality_result.get('predictor_loss', 0)
                 if isinstance(predictor_loss, torch.Tensor):
                     total_predictor_loss += predictor_loss
+
 
         # 循环一致性损失
         cycle_loss = 0.0
@@ -585,4 +586,5 @@ class CLIPransformerSS(pl.LightningModule):
             'cycle_loss': cycle_loss,
             'total_quality_loss': total_predictor_loss + cycle_loss
         }
+
 
