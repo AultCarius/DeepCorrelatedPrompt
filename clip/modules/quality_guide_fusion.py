@@ -92,12 +92,15 @@ class QualityGuidedFusion(nn.Module):
         Returns:
             综合质量分数 [0, 1]
         """
+        # todo:先禁用一下这里
         quality_vector = torch.tensor([
             modal_quality_dict['intrinsic_quality'].item(),
             modal_quality_dict['representation_quality'].item(),
             modal_quality_dict['generation_confidence'].item(),
             modal_quality_dict['task_contribution'].item()
         ]).to(next(self.parameters()).device)
+
+
 
         return self.modal_quality_aggregator(quality_vector.unsqueeze(0)).squeeze(0)
 
@@ -233,6 +236,7 @@ class QualityGuidedFusion(nn.Module):
 
                 if USE_ADAPTIVE_MIXING:
                     # 基于生成置信度混合文本特征
+                    # 基于generation_confidence
                     original_text = text_feat[i]
                     final_text = self.adaptive_feature_mixing(
                         text_feat[i],
@@ -274,6 +278,7 @@ class QualityGuidedFusion(nn.Module):
                         print(f"\n缺失图像 - 跳过自适应混合，使用原始特征")
 
             # 4. 质量感知特征补偿
+            #这里的质量分数其实是基于几个不可靠的质量给出来的。我在评估那里姑且先都给1
             if USE_QUALITY_COMPENSATION:
                 original_img_norm = torch.norm(final_img)
                 original_text_norm = torch.norm(final_text)

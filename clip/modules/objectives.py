@@ -344,6 +344,17 @@ def compute_objective_quality_loss(quality_scores, image_features, text_features
     更新版：适配新的质量分数结构。
     """
 
+    for q in quality_scores:
+        for k1 in ['image_quality', 'text_quality']:
+            for k2 in ['task_contribution', 'representation_quality', 'intrinsic_quality', 'generation_confidence']:
+                v = q[k1][k2]
+                if not torch.isfinite(v):
+                    print(f"[NaN Detect] {k1}.{k2} = {v}")
+        if not torch.isfinite(q['cross_modal_consistency']):
+            print(f"[NaN Detect] cross_modal_consistency = {q['cross_modal_consistency']}")
+        if 'overall_uncertainty' in q and not torch.isfinite(q['overall_uncertainty']):
+            print(f"[NaN Detect] overall_uncertainty = {q['overall_uncertainty']}")
+
     task_correlation_loss = 0.0
     if current_task_performance is not None:
         for i, quality in enumerate(quality_scores):
@@ -432,32 +443,62 @@ def compute_objective_quality_loss(quality_scores, image_features, text_features
 
 
 
+# def extract_task_performance_mmimdb(mmimdb_logits, mmimdb_labels):
+#     """
+#     从MMIMDb任务输出中提取性能指标
+#     """
+#     if mmimdb_logits is None:
+#         return None
+#
+#     with torch.no_grad():
+#         # 计算预测置信度作为性能指标
+#         probs = torch.sigmoid(mmimdb_logits)
+#
+#         # 方法1：最高预测概率的平均值
+#         max_probs = torch.max(probs, dim=-1)[0]
+#
+#         # 方法2：预测分布的熵（低熵=高确定性=高性能）
+#         eps = 1e-8
+#         entropy = -torch.sum(probs * torch.log(probs + eps) +
+#                              (1 - probs) * torch.log(1 - probs + eps), dim=-1)
+#         normalized_entropy = entropy / (23 * np.log(2))  # 23个类别
+#         certainty = 1.0 - normalized_entropy
+#
+#         # 结合两个指标
+#         performance_score = 0.6 * max_probs + 0.4 * certainty
+#
+#     if not torch.isfinite(performance_score).all():
+#         print("[NaN Detect] performance_score contains NaN:", performance_score)
+#
+#     return performance_score.clamp(0.1, 0.9)
 def extract_task_performance_mmimdb(mmimdb_logits, mmimdb_labels):
-    """
-    从MMIMDb任务输出中提取性能指标
-    """
     if mmimdb_logits is None:
         return None
 
     with torch.no_grad():
-        # 计算预测置信度作为性能指标
         probs = torch.sigmoid(mmimdb_logits)
 
-        # 方法1：最高预测概率的平均值
-        max_probs = torch.max(probs, dim=-1)[0]
+        # 转换标签格式
+        if isinstance(mmimdb_labels, list):
+            labels = torch.tensor(mmimdb_labels).float().to(probs.device)
+        else:
+            labels = mmimdb_labels.float()
 
-        # 方法2：预测分布的熵（低熵=高确定性=高性能）
-        eps = 1e-8
-        entropy = -torch.sum(probs * torch.log(probs + eps) +
-                             (1 - probs) * torch.log(1 - probs + eps), dim=-1)
-        normalized_entropy = entropy / (23 * np.log(2))  # 23个类别
-        certainty = 1.0 - normalized_entropy
+        # 计算样本级别的F1分数或准确率
+        preds = (probs > 0.5).float()
+
+        # 计算每个样本的Jaccard相似度（适合多标签）
+        intersection = (preds * labels).sum(dim=-1)
+        union = (preds + labels).clamp(max=1).sum(dim=-1)
+        jaccard = intersection / (union + 1e-8)
+
+        # 或者计算标签预测的平均准确率
+        correct = (preds == labels).float().mean(dim=-1)
 
         # 结合两个指标
-        performance_score = 0.6 * max_probs + 0.4 * certainty
+        performance_score = 0.7 * jaccard + 0.3 * correct
 
-    return performance_score.clamp(0.1, 0.9)
-
+    return torch.clamp(performance_score, 0.1, 0.9)
 
 def compute_enhanced_mmimdb(pl_module, batch):
     """
@@ -481,7 +522,11 @@ def compute_enhanced_mmimdb(pl_module, batch):
     # 3. 【新增】质量感知损失
     quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
 
-    if (hasattr(pl_module.model, 'last_quality_scores') and
+    # 获取当前epoch
+    current_epoch = pl_module.current_epoch
+
+    if (current_epoch >= 2 and
+            hasattr(pl_module.model, 'last_quality_scores') and
             pl_module.model.last_quality_scores and
             phase == "train"):  # 只在训练时计算质量损失
 
@@ -526,6 +571,240 @@ def compute_enhanced_mmimdb(pl_module, batch):
     pl_module.log(f"mmimdb/{phase}/loss", loss)
 
     return ret
+
+
+def compute_enhanced_mmimdb_v2(pl_module, batch):
+    """
+    增强版MMIMDb计算 - 集成新的质量感知损失
+    基于EnhancedQualityEstimator的版本
+    """
+    phase = "train" if pl_module.training else "val"
+
+    # 1. 标准的MMIMDb前向传播
+    infer = pl_module.infer(batch)
+    imgcls_logits = pl_module.mmimdb_classifier(infer["cls_feats"])
+    imgcls_labels = batch["label"]
+    imgcls_labels = torch.tensor(imgcls_labels).to(pl_module.device).float()
+
+    # 2. 主要的分类损失
+    mmimdb_loss = F.binary_cross_entropy_with_logits(imgcls_logits, imgcls_labels)
+
+    # 3. 【新增】基于增强质量评估的损失
+    enhanced_quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
+    predictor_training_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
+
+    if (hasattr(pl_module.model, 'cached_quality_results') and
+            pl_module.model.cached_quality_results and
+            phase == "train"):  # 只在训练时计算质量损失
+
+        quality_results = pl_module.model.cached_quality_results
+
+        # 3.1 预测器训练损失
+        total_predictor_loss = 0.0
+        for quality_result in quality_results:
+            predictor_loss = quality_result.get('predictor_loss', 0)
+            if isinstance(predictor_loss, torch.Tensor) and predictor_loss.requires_grad:
+                total_predictor_loss += predictor_loss
+
+        predictor_training_loss = total_predictor_loss / max(len(quality_results), 1)
+
+        # 3.2 质量一致性损失 - 基于任务性能的质量验证
+        enhanced_quality_loss = compute_enhanced_quality_consistency_loss(
+            quality_results, imgcls_logits, imgcls_labels, batch["missing_type"]
+        )
+
+    # 4. 返回结果
+    ret = {
+        "mmimdb_loss": mmimdb_loss,
+        "mmimdb_enhanced_quality_loss": enhanced_quality_loss,  # 新的质量损失
+        "mmimdb_predictor_loss": predictor_training_loss,  # 预测器训练损失
+        "mmimdb_logits": imgcls_logits,
+        "mmimdb_labels": imgcls_labels,
+    }
+
+    # 5. 记录指标
+    loss = getattr(pl_module, f"{phase}_mmimdb_loss")(ret["mmimdb_loss"])
+
+    # 记录质量损失
+    if enhanced_quality_loss.item() > 0:
+        pl_module.log(f"mmimdb/{phase}/enhanced_quality_loss", enhanced_quality_loss)
+    if predictor_training_loss.item() > 0:
+        pl_module.log(f"mmimdb/{phase}/predictor_loss", predictor_training_loss)
+
+    f1_scores = getattr(pl_module, f"{phase}_mmimdb_F1_scores")(
+        ret["mmimdb_logits"], ret["mmimdb_labels"]
+    )
+    pl_module.log(f"mmimdb/{phase}/loss", loss)
+
+    return ret
+
+
+def compute_enhanced_quality_consistency_loss(quality_results, task_logits, task_labels, missing_type):
+    """
+    计算增强的质量一致性损失
+
+    Args:
+        quality_results: List[Dict] 来自EnhancedQualityEstimator的质量结果
+        task_logits: [batch_size, num_classes] 任务预测logits
+        task_labels: [batch_size, num_classes] 任务标签
+        missing_type: [batch_size] 缺失类型
+
+    Returns:
+        质量一致性损失
+    """
+    if not quality_results:
+        return torch.tensor(0.0, requires_grad=True)
+
+    batch_size = len(quality_results)
+    device = task_logits.device
+
+    # 1. 基于任务性能的质量验证
+    task_performance_loss = 0.0
+
+    # 计算每个样本的任务性能指标
+    with torch.no_grad():
+        task_probs = torch.sigmoid(task_logits)  # 多标签分类
+        # 计算预测置信度作为性能指标
+        prediction_confidence = torch.max(task_probs, dim=-1)[0]
+
+        # 方法2：预测准确率（逐标签比较，取平均）
+        preds = (task_probs > 0.5).float()
+        correct = (preds == task_labels).float()
+        prediction_accuracy = correct.mean(dim=-1)  # shape: [B]
+
+        # 综合任务性能分数
+        task_performance = 0.7 * prediction_confidence + 0.3 * prediction_accuracy
+
+    for i, quality_result in enumerate(quality_results):
+        # 获取质量分数
+        overall_img_quality = quality_result['overall_img_quality']
+        overall_text_quality = quality_result['overall_text_quality']
+        overall_confidence = quality_result['overall_confidence']
+
+        # 综合质量分数
+        if missing_type[i] == 0:  # 完整模态
+            combined_quality = (overall_img_quality + overall_text_quality) / 2
+        elif missing_type[i] == 1:  # 缺失文本
+            combined_quality = overall_img_quality * 0.8  # 降权
+        elif missing_type[i] == 2:  # 缺失图像
+            combined_quality = overall_text_quality * 0.8  # 降权
+        else:
+            combined_quality = (overall_img_quality + overall_text_quality) / 4  # 严重降权
+
+        # 质量与任务性能的一致性损失
+        # 期望：高质量样本有高任务性能，低质量样本有低任务性能
+        performance_quality_gap = torch.abs(combined_quality - task_performance[i])
+        task_performance_loss += performance_quality_gap
+
+    task_performance_loss = task_performance_loss / batch_size
+
+    # 2. 质量内部一致性损失
+    internal_consistency_loss = 0.0
+
+    for quality_result in quality_results:
+        # 数学质量与任务相关性的一致性
+        img_math_quality = quality_result['img_intrinsic_quality']['norm_stability']
+        text_math_quality = quality_result['text_intrinsic_quality']['norm_stability']
+
+        # 获取任务相关性
+        task_relevance = quality_result['task_relevance']
+        if 'img_task_relevance' in task_relevance:
+            img_task_relevance = task_relevance['img_task_relevance']
+            text_task_relevance = task_relevance['text_task_relevance']
+        else:
+            img_task_relevance = task_relevance['img_gradient_magnitude']
+            text_task_relevance = task_relevance['text_gradient_magnitude']
+
+        # 内部一致性：数学质量高的特征，任务相关性也应该相对较高
+        img_consistency = torch.abs(img_math_quality - img_task_relevance)
+        text_consistency = torch.abs(text_math_quality - text_task_relevance)
+
+        internal_consistency_loss += (img_consistency + text_consistency) / 2
+
+    internal_consistency_loss = internal_consistency_loss / len(quality_results)
+
+    # 3. 模态平衡损失
+    modality_balance_loss = 0.0
+
+    complete_samples = [i for i, mt in enumerate(missing_type) if mt == 0]
+    missing_samples = [i for i, mt in enumerate(missing_type) if mt != 0]
+
+    if len(complete_samples) > 0 and len(missing_samples) > 0:
+        # 完整样本的平均质量应该高于缺失样本
+        complete_qualities = []
+        missing_qualities = []
+
+        for i in complete_samples:
+            quality_result = quality_results[i]
+            complete_quality = (
+                                       quality_result['overall_img_quality'] +
+                                       quality_result['overall_text_quality']
+                               ) / 2
+            complete_qualities.append(complete_quality)
+
+        for i in missing_samples:
+            quality_result = quality_results[i]
+            if missing_type[i] == 1:  # 缺失文本
+                missing_quality = quality_result['overall_img_quality']
+            elif missing_type[i] == 2:  # 缺失图像
+                missing_quality = quality_result['overall_text_quality']
+            else:
+                missing_quality = (
+                                          quality_result['overall_img_quality'] +
+                                          quality_result['overall_text_quality']
+                                  ) / 2
+            missing_qualities.append(missing_quality)
+
+        complete_avg = torch.stack(complete_qualities).mean()
+        missing_avg = torch.stack(missing_qualities).mean()
+
+        # 期望完整样本质量高于缺失样本
+        modality_balance_loss = F.relu(missing_avg - complete_avg + 0.1)
+
+    # 4. 总的质量一致性损失
+    total_loss = (
+            0.4 * task_performance_loss +
+            0.3 * internal_consistency_loss +
+            0.3 * modality_balance_loss
+    )
+
+    return total_loss
+
+
+def compute_gradient_quality_alignment_loss(quality_results, model_features):
+    """
+    计算梯度与质量的对齐损失（可选的额外损失）
+    """
+    if not quality_results or not hasattr(model_features, 'cached_features'):
+        return torch.tensor(0.0, requires_grad=True)
+
+    alignment_loss = 0.0
+
+    for i, quality_result in enumerate(quality_results):
+        # 如果有梯度信息
+        if 'task_relevance' in quality_result:
+            task_relevance = quality_result['task_relevance']
+
+            if 'img_gradient_magnitude' in task_relevance:
+                # 梯度幅度与预测的任务相关性应该一致
+                if 'img_task_relevance' in task_relevance:
+                    img_gradient_pred_gap = torch.abs(
+                        task_relevance['img_gradient_magnitude'] -
+                        task_relevance['img_task_relevance']
+                    )
+                    text_gradient_pred_gap = torch.abs(
+                        task_relevance['text_gradient_magnitude'] -
+                        task_relevance['text_task_relevance']
+                    )
+
+                    alignment_loss += (img_gradient_pred_gap + text_gradient_pred_gap) / 2
+
+    if len(quality_results) > 0:
+        alignment_loss = alignment_loss / len(quality_results)
+
+    return alignment_loss
+
+
 
 
 # 同样的方式可以为其他任务实现
