@@ -14,6 +14,9 @@ from .quality_estimator import QualityEstimator
 from .quality_guide_fusion import QualityGuidedFusion
 # ====质量提示
 from .quality_aware_prompt import QualityAwarePromptLearner, IterativeQualityOptimization
+# ====新增新质量与新融合
+from  .enhanced_quality_estimator import EnhancedQualityEstimator
+from  .enhanced_quality_guide_fusion import QualityAwareFusion
 
 
 def load_clip_to_cpu(backbone_name, prompt_length, prompt_depth):
@@ -189,73 +192,105 @@ class CustomCLIP(nn.Module):
             dropout=0.1
         )
         # 【新增】质量评估器
-        self.quality_estimator = QualityEstimator(hidden_size=512)
+        self.enhanced_quality_estimator = EnhancedQualityEstimator(hidden_size=512)
 
         # 【新增】质量引导融合器
-        self.quality_fusion = QualityGuidedFusion(
-            hidden_size=512,
-            fusion_strategy='adaptive_attention'  # 可配置
-        )
+        self.quality_aware_fusion = QualityAwareFusion(hidden_size=512)
 
         # 【新增】质量感知Prompt学习器
         self.quality_prompt_learner = QualityAwarePromptLearner(
             self.prompt_learner, prompt_length, prompt_depth
         )
 
-        # 【新增】迭代优化器
-        self.iterative_optimizer = IterativeQualityOptimization({
-            'image_encoder': self.image_encoder,
-            'text_encoder': self.text_encoder,
-            'modal_generator': self.modal_generator,
-            'quality_estimator': self.quality_estimator,
-            'quality_fusion': self.quality_fusion,
-            'quality_prompt_learner': self.quality_prompt_learner
-        })
 
         # 训练策略控制
         self.use_iterative_optimization = True
         self.use_quality_aware_prompts = True
+
+        # 训练控制参数
+        self.use_enhanced_quality = True  # 是否使用新的质量评估
+        self.use_quality_aware_prompts = False  # 是否使用质量感知prompt
+
+        # 缓存变量，用于损失计算
+        self.cached_features = {}
+        self.cached_quality_results = None
+
         #========================================
-        # 【第一步新增】客观质量评估器
-        from .quality_estimator import ObjectiveQualityAssessor
-        self.objective_quality_assessor = ObjectiveQualityAssessor(hidden_size=512)
+        # # 【第一步新增】客观质量评估器
+        # from .quality_estimator import ObjectiveQualityAssessor
+        # self.objective_quality_assessor = ObjectiveQualityAssessor(hidden_size=512)
 
-
+    def create_task_forward_function(self, tokenized_texts, all_prompts_text, all_prompts_image, missing_type):
+        """创建任务前向函数，用于质量评估中的扰动分析"""
+        def task_forward_fn(img_feat, text_feat):
+            # 简化的前向，只做特征编码，不涉及prompt
+            return torch.cat([img_feat, text_feat], dim=-1)
+        return task_forward_fn
 
     def forward(self, image, text, missing_type):
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(
             image.get_device()).squeeze(1)  # extract texts from the first key  # [b, 77]
+
         # 1. 基础编码
         all_prompts_image, all_prompts_text = self.prompt_learner(missing_type)
-        text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+
+        # 启用梯度计算，为质量评估做准备
         image_features = self.image_encoder(image.type(self.dtype), all_prompts_image, missing_type)
+        text_features = self.text_encoder(tokenized_texts, all_prompts_text, missing_type)
+
+        # 确保特征有梯度（用于梯度分析）
+        if self.training:
+            image_features = image_features.requires_grad_(True)
+            text_features = text_features.requires_grad_(True)
 
         # 2. 模态生成
         enhanced_image_features, enhanced_text_features = self.modal_generator(
             image_features, text_features, missing_type
         )
 
-        # 3. 【第一步新增】客观质量评估
-        quality_scores = self.objective_quality_assessor(
-            image_features, text_features,
-            enhanced_image_features, enhanced_text_features,
-            missing_type
-        )
+        # 3. 【新增】增强质量评估
+        if self.use_enhanced_quality:
+            # 创建任务前向函数用于扰动分析
+            task_forward_fn = self.create_task_forward_function(
+                tokenized_texts, all_prompts_text, all_prompts_image, missing_type
+            )
 
-        # 保存质量分数供损失计算使用
-        # 保存所有必要的特征
-        self.last_image_features = image_features
-        self.last_text_features = text_features
-        self.last_enhanced_image_features = enhanced_image_features  # 新增
-        self.last_enhanced_text_features = enhanced_text_features  # 新增
-        self.last_quality_scores = quality_scores
+            # 计算临时任务损失用于梯度分析（在训练模式下）
+            task_loss = None
+            if self.training:
+                # 创建临时的分类头用于计算损失
+                temp_classifier = nn.Linear(1024, 2).to(image_features.device)  # 假设2分类任务
+                temp_features = torch.cat([image_features, text_features], dim=-1)
+                temp_logits = temp_classifier(temp_features)
+                temp_labels = torch.zeros(temp_logits.size(0), dtype=torch.long).to(image_features.device)
+                task_loss = F.cross_entropy(temp_logits, temp_labels)
 
-        # 4. 特征融合（暂时保持原有逻辑，后续步骤会改进）
-        fused_features = self.quality_fusion(
-            image_features, text_features,
-            enhanced_image_features, enhanced_text_features,
-            quality_scores, missing_type
-        )
+            # 质量评估
+            quality_results = self.enhanced_quality_estimator(
+                image_features, text_features, task_loss, task_forward_fn
+            )
+
+            # 缓存质量结果用于损失计算
+            self.cached_quality_results = quality_results
+
+            # 4. 【新增】质量感知融合
+            fused_features = self.quality_aware_fusion(
+                image_features, text_features,
+                enhanced_image_features, enhanced_text_features,
+                quality_results, missing_type
+            )
+        else:
+            # 使用原有融合方式
+            fused_features = torch.cat([image_features, text_features], dim=-1)
+
+        # 缓存特征用于损失计算
+        self.cached_features = {
+            'image_features': image_features,
+            'text_features': text_features,
+            'enhanced_image_features': enhanced_image_features,
+            'enhanced_text_features': enhanced_text_features,
+            'fused_features': fused_features
+        }
 
         return fused_features
 
@@ -275,6 +310,7 @@ class CLIPransformerSS(pl.LightningModule):
         # 【新增】循环一致性损失权重
         self.cycle_loss_weight = config.get('cycle_loss_weight', 0.02)
         self.quality_loss_weight = config.get('quality_loss_weight', 0.01)  # 【新增】
+        self.predictor_loss_weight = config.get('predictor_loss_weight', 0.005)  # 预测器损失权重
         # 【新增】训练策略控制
         self.warmup_epochs = config.get('warmup_epochs', 5)
         self.quality_aware_epochs = config.get('quality_aware_epochs', 10)
@@ -338,6 +374,8 @@ class CLIPransformerSS(pl.LightningModule):
             self.load_state_dict(state_dict, strict=True)
         self.records = {}
 
+
+
     def infer(
             self,
             batch,
@@ -399,7 +437,8 @@ class CLIPransformerSS(pl.LightningModule):
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
             # ret.update(objectives.compute_mmimdb(self, batch))
-            ret.update(objectives.compute_enhanced_mmimdb(self, batch))
+            # ret.update(objectives.compute_enhanced_mmimdb(self, batch))
+            ret.update(objectives.compute_enhanced_mmimdb_v2(self, batch))
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -411,36 +450,29 @@ class CLIPransformerSS(pl.LightningModule):
         clip_utils.set_task(self)
         output = self(batch)
         # 主任务损失
-        main_loss = sum([v for k, v in output.items() if "loss" in k and "quality" not in k])
+        main_loss = sum([v for k, v in output.items() if "loss" in k and "quality" not in k and "predictor" not in k])
 
-        # 质量损失（已经在各个任务中计算）
-        quality_loss = sum([v for k, v in output.items() if "quality_loss" in k])
+        # 质量相关损失
+        quality_losses = self.compute_quality_losses()
 
-        current_weights = self.get_current_loss_weights()
-        cycle_loss = 0.0
-        total_loss = main_loss + self.quality_loss_weight * quality_loss
-        # 循环一致性损失
-        if current_weights['cycle'] > 0 and hasattr(self.model, 'last_image_features'):
-            cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
-                self.model.last_image_features,
-                self.model.last_text_features,
-                batch["missing_type"]
-            )
-            if cycle_loss is not None and cycle_loss > 0:
-                total_loss = total_loss + current_weights['cycle'] * cycle_loss
-                self.log("train/cycle_loss", cycle_loss)
-                self.log("train/cycle_weight", current_weights['cycle'])
+        total_loss = main_loss
 
+        # 添加质量损失
+        if quality_losses['predictor_loss'] > 0:
+            total_loss += self.predictor_loss_weight * quality_losses['predictor_loss']
+            self.log("train/predictor_loss", quality_losses['predictor_loss'])
 
-        if not torch.isfinite(total_loss):
-            print("[NaN Detect] total_loss is NaN")
-            print("main_loss =", main_loss)
-            print("quality_loss =", quality_loss)
-            print("cycle_loss =", cycle_loss)
+        if quality_losses['cycle_loss'] > 0:
+            total_loss += self.cycle_loss_weight * quality_losses['cycle_loss']
+            self.log("train/cycle_loss", quality_losses['cycle_loss'])
 
-        # 记录训练阶段
-        self.log("train/training_stage", float(self.current_epoch))
+        # 记录各个损失
+        self.log("train/main_loss", main_loss)
+        self.log("train/total_loss", total_loss)
+        self.log("train/epoch", float(self.current_epoch))
+
         return total_loss
+
 
     def training_epoch_end(self, outs):
         clip_utils.epoch_wrapup(self)
@@ -476,31 +508,6 @@ class CLIPransformerSS(pl.LightningModule):
     def configure_optimizers(self):
         return clip_utils.set_schedule(self)
 
-    def compute_quality_loss_in_training(self, model_output, batch):
-        """
-        在训练中计算真正客观的质量损失
-        """
-        if not hasattr(self.model, 'last_quality_scores'):
-            return torch.tensor(0.0)
-
-        # 获取当前任务性能
-        current_task = self.current_tasks[0] if self.current_tasks else None
-        task_performance = extract_current_task_performance(
-            model_output, batch, current_task
-        )
-
-        # 计算客观质量损失
-        quality_loss = compute_objective_quality_loss(
-            self.model.last_quality_scores,
-            self.model.last_image_features,
-            self.model.last_text_features,
-            getattr(self.model, 'last_enhanced_image_features', None),
-            getattr(self.model, 'last_enhanced_text_features', None),
-            batch["missing_type"],
-            task_performance
-        )
-
-        return quality_loss
 
     def create_loss_scheduler(self):
         """创建自适应损失调度器"""
@@ -552,137 +559,30 @@ class CLIPransformerSS(pl.LightningModule):
             self.model.use_iterative_optimization = True
             self.model.use_quality_aware_prompts = True
 
+    def compute_quality_losses(self):
+        """计算质量相关的损失"""
+        total_quality_loss = 0.0
+        total_predictor_loss = 0.0
 
-def compute_objective_quality_loss(quality_scores, image_features, text_features,
-                                   enhanced_image_features, enhanced_text_features,
-                                   missing_type, current_task_performance):
-    """
-    完全基于客观指标的质量损失，不使用任何人工标签
+        if self.model.cached_quality_results is not None:
+            for quality_result in self.model.cached_quality_results:
+                # 预测器训练损失
+                predictor_loss = quality_result.get('predictor_loss', 0)
+                if isinstance(predictor_loss, torch.Tensor):
+                    total_predictor_loss += predictor_loss
 
-    核心思想：
-    1. 质量指标与任务性能应该正相关
-    2. 不同质量指标之间应该有合理的内在一致性
-    3. 利用数据本身的内在结构作为监督信号
-    """
-
-    # 1. 【任务相关性损失】质量分数应该与实际任务性能正相关
-    task_correlation_loss = 0.0
-    if current_task_performance is not None:
-        for i, quality in enumerate(quality_scores):
-            # 计算综合质量分数
-            overall_quality = (
-                                      quality['contrastive_quality'] +
-                                      quality['cross_modal_consistency'] +
-                                      quality['representation_quality']
-                              ) / 3
-
-            # 期望：质量高的样本任务性能也高
-            # 使用ranking loss而非绝对值匹配
-            task_correlation_loss += F.relu(0.1 - overall_quality * current_task_performance[i])
-
-    # 2. 【内在一致性损失】不同质量指标间应该有合理关系
-    consistency_loss = 0.0
-    for quality in quality_scores:
-        contrastive_q = quality['contrastive_quality']
-        consistency_q = quality['cross_modal_consistency']
-        confidence_q = quality['generation_confidence']
-
-        # 对比质量高 → 一致性也应该高
-        consistency_loss += F.relu(contrastive_q - consistency_q - 0.2)
-
-        # 一致性高 → 生成置信度也应该高
-        consistency_loss += F.relu(consistency_q - confidence_q - 0.1)
-
-    # 3. 【物理约束损失】利用数据内在结构
-    physics_loss = 0.0
-    batch_size = len(quality_scores)
-
-    if batch_size > 1:
-        # 完整模态样本的质量应该普遍高于缺失模态样本
-        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
-        missing_indices = [i for i, mt in enumerate(missing_type) if mt != 0]
-
-        if len(complete_indices) > 0 and len(missing_indices) > 0:
-            complete_qualities = torch.stack([
-                (quality_scores[i]['contrastive_quality'] +
-                 quality_scores[i]['cross_modal_consistency']) / 2
-                for i in complete_indices
-            ])
-            missing_qualities = torch.stack([
-                (quality_scores[i]['contrastive_quality'] +
-                 quality_scores[i]['cross_modal_consistency']) / 2
-                for i in missing_indices
-            ])
-
-            # margin ranking loss: 完整模态质量应该高于缺失模态
-            complete_mean = complete_qualities.mean()
-            missing_mean = missing_qualities.mean()
-            physics_loss += F.relu(missing_mean - complete_mean + 0.1)
-
-    # 4. 【特征距离一致性】生成特征的距离应该反映质量
-    distance_consistency_loss = 0.0
-    for i, quality in enumerate(quality_scores):
-        if missing_type[i] == 1:  # 缺失文本
-            # 原始文本与生成文本的距离
-            text_distance = F.mse_loss(text_features[i], enhanced_text_features[i])
-            generation_confidence = quality['generation_confidence']
-
-            # 期望：距离小 ↔ 置信度高
-            distance_consistency_loss += F.mse_loss(
-                1.0 - text_distance,  # 距离小 → 值大
-                generation_confidence
+        # 循环一致性损失
+        cycle_loss = 0.0
+        if hasattr(self.model, 'cached_features') and self.model.cached_features:
+            cycle_loss = self.model.modal_generator.compute_cycle_consistency_loss(
+                self.model.cached_features['image_features'],
+                self.model.cached_features['text_features'],
+                [0] * self.model.cached_features['image_features'].size(0)  # 假设都是完整模态
             )
 
-        elif missing_type[i] == 2:  # 缺失图像
-            img_distance = F.mse_loss(image_features[i], enhanced_image_features[i])
-            generation_confidence = quality['generation_confidence']
+        return {
+            'predictor_loss': total_predictor_loss,
+            'cycle_loss': cycle_loss,
+            'total_quality_loss': total_predictor_loss + cycle_loss
+        }
 
-            distance_consistency_loss += F.mse_loss(
-                1.0 - img_distance,
-                generation_confidence
-            )
-
-    # 5. 【信息论约束】利用熵和互信息
-    info_theory_loss = 0.0
-    for quality in quality_scores:
-        uncertainty = quality['prediction_uncertainty']
-        consistency = quality['cross_modal_consistency']
-
-        # 高不确定性 + 高一致性 = 矛盾，应该惩罚
-        contradiction_penalty = uncertainty * consistency
-        info_theory_loss += contradiction_penalty
-
-    # 总的客观质量损失
-    total_quality_loss = (
-                                 0.3 * task_correlation_loss +
-                                 0.25 * consistency_loss +
-                                 0.2 * physics_loss +
-                                 0.15 * distance_consistency_loss +
-                                 0.1 * info_theory_loss
-                         ) / max(len(quality_scores), 1)
-
-
-# 任务性能提取函数
-def extract_current_task_performance(model_output, batch, task_name):
-    """
-    从当前任务输出中提取性能指标作为质量监督信号
-    """
-    if task_name == "mmimdb":
-        # 对于多标签分类，用预测置信度作为性能指标
-        logits = model_output.get('mmimdb_logits')
-        if logits is not None:
-            # 计算预测置信度
-            probs = torch.sigmoid(logits)
-            confidence = torch.max(probs, dim=-1)[0]  # 最高类别置信度
-            return confidence.detach()
-
-    elif task_name == "hatememes":
-        # 对于二分类，用预测确定性
-        logits = model_output.get('hatememes_logits')
-        if logits is not None:
-            probs = F.softmax(logits, dim=-1)
-            # 预测越确定（接近0或1），性能指标越高
-            certainty = torch.max(probs, dim=-1)[0]
-            return certainty.detach()
-
-    return None

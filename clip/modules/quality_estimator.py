@@ -450,6 +450,43 @@ class ObjectiveQualityAssessor(nn.Module):
                 'overall_uncertainty': overall_uncertainty
             }
 
+            # 调试用
+            # 标量值设为1
+            device = image_features.device
+
+            img_intrinsic_fake = torch.tensor(1.0, device=device)
+            text_intrinsic_fake = torch.tensor(1.0, device=device)
+            img_generation_confidence_fake = torch.tensor(1.0, device=device)
+            text_generation_confidence_fake = torch.tensor(1.0, device=device)
+            overall_uncertainty_fake = torch.tensor(1.0, device=device)
+            cross_modal_consistency_fake = torch.tensor(1.0, device=device)
+
+            # 向量值设为1（假设原维度为1）
+            img_representation_fake = torch.tensor([1.0], device=device)
+            text_representation_fake = torch.tensor([1.0], device=device)
+            img_task_contrib_fake = torch.tensor(1.0, device=device, dtype=torch.float16)
+            text_task_contrib_fake = torch.tensor(1.0, device=device, dtype=torch.float16)
+
+            # 替换原始字典
+            sample_quality = {
+                'image_quality': {
+                    'intrinsic_quality': img_intrinsic_fake,
+                    'representation_quality': img_representation_fake,
+                    'generation_confidence': img_generation_confidence,
+                    'task_contribution': img_task_contrib
+                },
+                'text_quality': {
+                    'intrinsic_quality': text_intrinsic_fake,
+                    'representation_quality': text_representation_fake,
+                    'generation_confidence': text_generation_confidence,
+                    'task_contribution': text_task_contrib
+                },
+                'cross_modal_consistency': cross_modal_consistency,
+                'overall_uncertainty': overall_uncertainty
+            }
+
+
+
             quality_scores.append(sample_quality)
 
         return quality_scores
