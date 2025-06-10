@@ -533,3 +533,4 @@ class QualityGuidedFusion(nn.Module):
             })
 
         return weights_info
+
