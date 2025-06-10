@@ -253,6 +253,14 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
         self.prompt_length_half = prompt_length//3
         #self.attn_prompt = ScaledDotProductAttention(scale=np.power(d_model, 0.5))
+        self.original_prompt_length_half = prompt_length // 3  # 12
+        if i == 0:  # 第0层
+            # 支持质量增强：36个提示
+            self.prompt_length_half = self.original_prompt_length_half  # 保持12，用于动态提示生成
+            self.max_prompt_length_layer_0 = self.original_prompt_length_half * 3  # 36，支持质量提示
+        else:  # 其他层
+            self.prompt_length_half = self.original_prompt_length_half  # 12
+
         if i ==0 and i<=prompt_depth:
             self.attn_prompt = nn.MultiheadAttention(d_model, 1)
             self.prompts_dynamic_complete = nn.init.normal_(torch.empty(self.prompt_length_half, 1, d_model, dtype=torch.float), std=0.02)
@@ -284,31 +292,45 @@ class ResidualAttentionBlock(nn.Module):
             # First check if the ith layer needs compound prompts or not
             if counter == 0:
                 # First check if the ith layer needs compound prompts or not
+                # 第0层：处理质量增强的提示
                 if not (counter > len(compound_prompts_deeper) - 1):
-                    # Remove the outputs produced by learnable tokens of previous layer
                     if not self.first_layer:
-                        visual_features = x[self.prompt_length_half*3:, :, :]
+                        # 【修改】动态计算需要移除的提示长度
+                        # 检查当前输入的提示长度
+                        total_input_length = x.shape[0]
+
+                        # 如果是质量增强的提示（长度更大），调整移除长度
+                        if total_input_length > self.prompt_length_half * 2:
+                            # 质量增强模式：移除前面的所有提示，保留视觉特征
+                            # 动态检测提示长度
+                            prompt_length_to_remove = total_input_length - 196  # 假设视觉特征是196
+                            visual_features = x[prompt_length_to_remove:, :, :]
+                        else:
+                            # 原有模式：移除前24个（compound + common）
+                            visual_features = x[self.prompt_length_half * 2:, :, :]
                     else:
                         visual_features = x
-                    #prompts_dynamic = self.attn_prompt(self.prompts_dynamic.repeat(1, batch_size, 1).to(x.get_device()), visual_features, visual_features, mask=None)[0]
+
+                    # 动态提示生成（保持原有逻辑）
                     prompts_dynamic = []
                     for i in range(len(missing_type)):
-                        if missing_type[i]==0:  # modality complete
+                        if missing_type[i] == 0:  # modality complete
                             prompts_dynamic.append(self.prompts_dynamic_complete)
-                        elif missing_type[i]==1:  # missing text 
+                        elif missing_type[i] == 1:  # missing text
                             prompts_dynamic.append(self.prompts_dynamic_image)
-                        elif missing_type[i]==2:  # missing image 
+                        elif missing_type[i] == 2:  # missing image
                             prompts_dynamic.append(self.prompts_dynamic_text)
                     prompts_dynamic = torch.cat(prompts_dynamic, 1)
-                    prompts_dynamic = self.attn_prompt(prompts_dynamic.to(x.get_device()), visual_features, visual_features, need_weights=False, attn_mask=None)[0]
-                    # Create/configure learnable tokens of this layer
+                    prompts_dynamic = \
+                    self.attn_prompt(prompts_dynamic.to(x.get_device()), visual_features, visual_features,
+                                     need_weights=False, attn_mask=None)[0]
+
+                    # 获取当前层的复合提示
                     prompts_staged_and_common = compound_prompts_deeper[counter]  # extract the correct index
                     prompts_staged_and_common = prompts_staged_and_common.permute(1, 0, 2)
-                    # Add the learnable tokens of this layer with the input, by replacing previous
-                    # layer learnable tokens
-                    x = torch.cat([prompts_staged_and_common, prompts_dynamic, visual_features], dim=0)
 
-                    # Once done, update the counter, so that the next time, it does not use same learnable tokens
+                    # 【修改】拼接提示：静态+动态+视觉特征
+                    x = torch.cat([prompts_staged_and_common, prompts_dynamic, visual_features], dim=0)
                     counter += 1
             else:
                 # First check if the ith layer needs compound prompts or not
@@ -386,7 +408,13 @@ class VisionTransformer(nn.Module):
         x = outputs[0]
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        x = self.ln_post(x[:, self.prompt_length, :])  # extract cls token
+        if len(all_prompts_image) > 0 and all_prompts_image[0] is not None:
+            # 检测第0层提示的实际长度
+            actual_prompt_length = all_prompts_image[0].shape[1]
+            x = self.ln_post(x[:, actual_prompt_length, :])  # 动态提取cls token
+        else:
+            # 如果没有提示，使用原有逻辑
+            x = self.ln_post(x[:, self.prompt_length, :])
 
         if self.proj is not None:
             x = x @ self.proj
