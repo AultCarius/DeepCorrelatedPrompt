@@ -682,9 +682,11 @@ class CustomCLIP(nn.Module):
         # self.cached_generation_info = None
         # self.cached_quality_scores = None
 
+
         # 【新增】质量提示控制
         self.quality_prompts_enabled = True
         self.quality_prompt_warmup_epochs = 0  # 前3个epoch不使用质量提示
+
 
     def set_quality_prompts_enabled(self, enabled: bool):
         """动态控制质量提示的启用"""
@@ -692,9 +694,8 @@ class CustomCLIP(nn.Module):
         self.prompt_learner.set_quality_prompts_enabled(enabled)
 
     def forward(self, image, text, missing_type, current_epoch=0):
-        """
-        === 核心修改：实现新的处理逻辑 ===
 
+        """
         新逻辑：
         1. 预处理：在编码前处理缺失模态
         2. 质量评估：基于完整输入评估质量
@@ -776,6 +777,7 @@ class CustomCLIP(nn.Module):
             'enhanced_image_features': enhanced_image_features,
             'enhanced_text_features': enhanced_text_features
         }
+
 
         return fused_features
 
@@ -936,9 +938,12 @@ class CLIPransformerSS(pl.LightningModule):
 
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
+
             ret.update(objectives.compute_mmimdb(self, batch))
+
             # ret.update(objectives.compute_enhanced_mmimdb(self, batch))
             # ret.update(objectives.compute_enhanced_mmimdb_v2(self, batch))
+
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -958,7 +963,6 @@ class CLIPransformerSS(pl.LightningModule):
             # 阶段2及以后：启用质量提示
             self.model.set_quality_prompts_enabled(True)
 
-        # 提取任务性能指标
         self._extract_task_performance_from_batch(batch)
 
         output = self(batch)
@@ -1085,6 +1089,7 @@ class CLIPransformerSS(pl.LightningModule):
             self.model.use_iterative_optimization = True
             self.model.use_quality_aware_prompts = True
 
+
     def _extract_task_performance_from_batch(self, batch):
         """【保留】从当前batch提取任务性能指标"""
         if "label" in batch:
@@ -1181,4 +1186,5 @@ class CLIPransformerSS(pl.LightningModule):
             self.log("quality/avg_img_relevance", sum(img_relevances) / len(img_relevances))
             self.log("quality/avg_text_relevance", sum(text_relevances) / len(text_relevances))
             self.log("quality/avg_overall_confidence", sum(overall_confidences) / len(overall_confidences))
+
 
