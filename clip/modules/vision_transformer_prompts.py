@@ -273,9 +273,36 @@ class ResidualAttentionBlock(nn.Module):
             self.first_layer = False
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        """
+        动态调整注意力掩码以匹配输入序列长度
+        """
+        sequence_length = x.shape[0]  # 获取实际序列长度
 
+        # 动态创建匹配的掩码
+        dynamic_mask = self.create_dynamic_mask(sequence_length)
+
+        if dynamic_mask is not None:
+            dynamic_mask = dynamic_mask.to(dtype=x.dtype, device=x.device)
+
+        return self.attn(x, x, x, need_weights=False, attn_mask=dynamic_mask)[0]
+
+    def create_dynamic_mask(self, sequence_length: int):
+        """
+        根据实际序列长度动态创建注意力掩码
+        Args:
+            sequence_length: 实际输入序列的长度
+        Returns:
+            适应序列长度的注意力掩码
+        """
+        if self.text_layer:
+            # 文本层：创建因果掩码（下三角）
+            mask = torch.empty(sequence_length, sequence_length)
+            mask.fill_(float("-inf"))
+            mask.triu_(1)  # 上三角填充-inf，实现因果注意力
+            return mask
+        else:
+            # 视觉层：通常不需要掩码，返回None以实现全注意力
+            return None
     def forward(self, inputs):
         # For the first layer, we do not need to add any duplicate, as it is already added
         # as the shallow version
@@ -303,7 +330,7 @@ class ResidualAttentionBlock(nn.Module):
                         if total_input_length > self.prompt_length_half * 2:
                             # 质量增强模式：移除前面的所有提示，保留视觉特征
                             # 动态检测提示长度
-                            prompt_length_to_remove = total_input_length - 196  # 假设视觉特征是196
+                            prompt_length_to_remove = total_input_length - 197  # 假设视觉特征是196
                             visual_features = x[prompt_length_to_remove:, :, :]
                         else:
                             # 原有模式：移除前24个（compound + common）
@@ -411,6 +438,7 @@ class VisionTransformer(nn.Module):
         if len(all_prompts_image) > 0 and all_prompts_image[0] is not None:
             # 检测第0层提示的实际长度
             actual_prompt_length = all_prompts_image[0].shape[1]
+            # print("all_prompts_image[0].shape",all_prompts_image[0].shape[1])
             x = self.ln_post(x[:, actual_prompt_length, :])  # 动态提取cls token
         else:
             # 如果没有提示，使用原有逻辑
