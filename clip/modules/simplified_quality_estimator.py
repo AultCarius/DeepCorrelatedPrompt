@@ -32,34 +32,29 @@ class SimplifiedQualityEstimator(nn.Module):
         )
 
         # 生成质量评估网络
-        self.generation_quality_evaluator = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
+        self.original_input_quality_evaluator = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size // 2, 1),
             nn.Sigmoid()
         )
 
     def compute_mathematical_quality(self, features):
-        """
-        计算基于数学的特征质量指标
-        Args:
-            features: [batch_size, hidden_size] 或 [hidden_size]
-        Returns:
-            质量分数字典
-        """
+        """=== 修改：添加数值稳定性保护 ==="""
         if features.dim() == 1:
             features = features.unsqueeze(0)
 
         batch_size, feature_dim = features.shape
 
-        # 1. 特征范数稳定性
+        # 1. 特征范数稳定性 - 添加稳定性保护
         feature_norms = torch.norm(features, dim=-1)
         ideal_norm = math.sqrt(feature_dim)
-        norm_stability = torch.exp(-torch.abs(feature_norms - ideal_norm) / ideal_norm)
+        norm_diff = torch.abs(feature_norms - ideal_norm) / (ideal_norm + 1e-8)
+        norm_stability = torch.exp(-torch.clamp(norm_diff, 0, 10))  # 限制指数范围
 
-        # 2. 特征信息熵（分布均匀性）
-        feature_probs = F.softmax(torch.abs(features), dim=-1)
+        # 2. 特征信息熵 - 添加稳定性保护
+        feature_probs = F.softmax(torch.abs(features) + 1e-8, dim=-1)  # 防止零概率
         entropy = -torch.sum(feature_probs * torch.log(feature_probs + 1e-8), dim=-1)
         max_entropy = math.log(feature_dim)
         normalized_entropy = entropy / max_entropy
@@ -67,11 +62,17 @@ class SimplifiedQualityEstimator(nn.Module):
         # 3. 特征稀疏性质量
         sparsity_ratio = torch.mean((torch.abs(features) < 0.01).float(), dim=-1)
         optimal_sparsity = 0.1
-        sparsity_quality = torch.exp(-torch.abs(sparsity_ratio - optimal_sparsity) / optimal_sparsity)
+        sparsity_quality = torch.exp(-torch.abs(sparsity_ratio - optimal_sparsity) / (optimal_sparsity + 1e-8))
 
-        # 4. 特征方差（信息丰富度）
+        # 4. 特征方差
         feature_variance = torch.var(features, dim=-1)
-        variance_quality = torch.sigmoid(feature_variance - 0.1)  # 期望方差大于0.1
+        variance_quality = torch.sigmoid(feature_variance - 0.1)
+
+        # === 添加：确保所有输出都是有限的 ===
+        norm_stability = torch.clamp(norm_stability, 1e-6, 1.0)
+        normalized_entropy = torch.clamp(normalized_entropy, 1e-6, 1.0)
+        sparsity_quality = torch.clamp(sparsity_quality, 1e-6, 1.0)
+        variance_quality = torch.clamp(variance_quality, 1e-6, 1.0)
 
         return {
             'norm_stability': norm_stability,
@@ -81,19 +82,14 @@ class SimplifiedQualityEstimator(nn.Module):
         }
 
     def compute_cross_modal_consistency(self, img_feat, text_feat):
-        """
-        计算跨模态一致性
-        Args:
-            img_feat: [batch_size, 512]
-            text_feat: [batch_size, 512]
-        """
+        """=== 保留：计算跨模态一致性 ==="""
         if img_feat.dim() == 1:
             img_feat = img_feat.unsqueeze(0)
             text_feat = text_feat.unsqueeze(0)
 
         # 1. 余弦相似度
         cosine_similarity = F.cosine_similarity(img_feat, text_feat, dim=-1)
-        semantic_alignment = (cosine_similarity + 1) / 2  # 归一化到[0,1]
+        semantic_alignment = (cosine_similarity + 1) / 2
 
         # 2. 特征距离质量
         feature_distance = torch.norm(img_feat - text_feat, dim=-1)
@@ -112,16 +108,14 @@ class SimplifiedQualityEstimator(nn.Module):
         }
 
     def compute_task_relevance(self, img_feat, text_feat):
-        """
-        计算任务相关性（简化版，避免复杂梯度计算）
-        """
-        # 使用网络预测任务相关性
+        """=== 修改：移除torch.no_grad()，让网络可以学习 ==="""
+        # 使用网络预测任务相关性（移除no_grad）
         img_relevance = self.task_relevance_predictor(img_feat).squeeze(-1)
         text_relevance = self.task_relevance_predictor(text_feat).squeeze(-1)
 
         # 计算跨模态协同性
         cross_modal_synergy = F.cosine_similarity(img_feat, text_feat, dim=-1)
-        cross_modal_synergy = (cross_modal_synergy + 1) / 2  # 归一化
+        cross_modal_synergy = (cross_modal_synergy + 1) / 2
 
         return {
             'img_task_relevance': img_relevance,
@@ -130,9 +124,7 @@ class SimplifiedQualityEstimator(nn.Module):
         }
 
     def compute_generation_confidence(self, original_feat, generated_feat):
-        """
-        计算生成特征的可信度
-        """
+        """=== 保留：计算生成特征的可信度 ==="""
         if original_feat.dim() == 1:
             original_feat = original_feat.unsqueeze(0)
             generated_feat = generated_feat.unsqueeze(0)
@@ -154,31 +146,39 @@ class SimplifiedQualityEstimator(nn.Module):
 
         return torch.clamp(generation_confidence, 0.1, 0.9)
 
-    def forward(self, image_feat, text_feat, enhanced_image_feat, enhanced_text_feat, missing_type):
+    def evaluate_input_quality(self, input_features, is_generated=False):
         """
-        主要的质量评估接口
+        === 新增：评估输入质量（区分原始和生成）===
+
+        Args:
+            input_features: 输入特征
+            is_generated: 是否为生成的输入
 
         Returns:
-            quality_scores: List[Dict] 每个样本的质量分数
-            格式: {
-                'image_quality': {
-                    'mathematical': Dict,     # 数学质量指标
-                    'task_relevance': float,  # 任务相关性
-                    'generation_confidence': float  # 生成置信度
-                },
-                'text_quality': {
-                    'mathematical': Dict,
-                    'task_relevance': float,
-                    'generation_confidence': float
-                },
-                'cross_modal_consistency': Dict,  # 跨模态一致性
-                'overall_confidence': float       # 整体置信度
-            }
+            质量分数
+        """
+        if is_generated:
+            # 对生成的输入，质量稍微打折
+            base_quality = self.original_input_quality_evaluator(input_features).squeeze(-1)
+            return base_quality * 0.8  # 生成质量打8折
+        else:
+            # 原始输入的质量评估
+            return self.original_input_quality_evaluator(input_features).squeeze(-1)
+
+    def forward(self, image_feat, text_feat, enhanced_image_feat, enhanced_text_feat, missing_type,
+                generation_info=None):
+        """
+        === 修改：主要质量评估接口 ===
+
+        新逻辑：
+        1. 对于完整模态，评估原始质量
+        2. 对于生成模态，评估生成质量
+        3. 基于完整特征进行跨模态评估
         """
         batch_size = image_feat.size(0)
         quality_scores = []
 
-        # 计算任务相关性（一次计算，所有样本）
+        # 计算任务相关性（基于所有特征，无论是否生成）
         task_relevance = self.compute_task_relevance(image_feat, text_feat)
 
         for i in range(batch_size):
@@ -186,13 +186,18 @@ class SimplifiedQualityEstimator(nn.Module):
 
             # === 图像质量评估 ===
             if missing_type[i] == 2:  # 缺失图像，使用生成的图像
-                current_img_feat = enhanced_image_feat[i]
-                img_generation_confidence = self.compute_generation_confidence(
-                    image_feat[i], enhanced_image_feat[i]
-                )
+                current_img_feat = enhanced_image_feat[i] if enhanced_image_feat is not None else image_feat[i]
+
+                # 如果有生成信息，计算生成置信度
+                if generation_info is not None and generation_info['generated_mask'][i, 0] > 0:
+                    img_generation_confidence = self.compute_generation_confidence(
+                        image_feat[i], current_img_feat
+                    )
+                else:
+                    img_generation_confidence = torch.tensor(0.9).to(image_feat.device)
             else:  # 完整图像或缺失文本
                 current_img_feat = image_feat[i]
-                img_generation_confidence = torch.tensor(0.9).to(image_feat.device)
+                img_generation_confidence = torch.tensor(0.9, device=image_feat.device, dtype=image_feat.dtype)
 
             img_math_quality = self.compute_mathematical_quality(current_img_feat)
 
@@ -204,10 +209,15 @@ class SimplifiedQualityEstimator(nn.Module):
 
             # === 文本质量评估 ===
             if missing_type[i] == 1:  # 缺失文本，使用生成的文本
-                current_text_feat = enhanced_text_feat[i]
-                text_generation_confidence = self.compute_generation_confidence(
-                    text_feat[i], enhanced_text_feat[i]
-                )
+                current_text_feat = enhanced_text_feat[i] if enhanced_text_feat is not None else text_feat[i]
+
+                # 如果有生成信息，计算生成置信度
+                if generation_info is not None and generation_info['generated_mask'][i, 1] > 0:
+                    text_generation_confidence = self.compute_generation_confidence(
+                        text_feat[i], current_text_feat
+                    )
+                else:
+                    text_generation_confidence = torch.tensor(0.9).to(text_feat.device)
             else:  # 完整文本或缺失图像
                 current_text_feat = text_feat[i]
                 text_generation_confidence = torch.tensor(0.9).to(text_feat.device)
@@ -249,78 +259,55 @@ class SimplifiedQualityEstimator(nn.Module):
         return quality_scores
 
     def compute_quality_loss(self, quality_scores, task_performance=None):
-        """
-        计算质量评估的训练损失
-        """
+        """=== 修改：确保返回可求导的张量 ==="""
         device = next(self.parameters()).device
 
-        # 初始化为张量而不是标量
-        quality_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # 初始化为可求导的张量
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         count = 0
 
-        for quality in quality_scores:
+        for i, quality in enumerate(quality_scores):
             # 1. 任务相关性应该与实际任务性能相关
-            if task_performance is not None:
+            if task_performance is not None and i < len(task_performance):
                 img_relevance = quality['image_quality']['task_relevance']
                 text_relevance = quality['text_quality']['task_relevance']
 
-                # 安全提取标量值并转换为张量
-                if torch.is_tensor(img_relevance):
-                    img_rel_value = img_relevance.item() if img_relevance.dim() == 0 else img_relevance.flatten()[
-                        0].item()
+                # 确保所有值都是张量且在正确设备上
+                if not torch.is_tensor(img_relevance):
+                    img_relevance = torch.tensor(float(img_relevance), device=device, requires_grad=True)
+                if not torch.is_tensor(text_relevance):
+                    text_relevance = torch.tensor(float(text_relevance), device=device, requires_grad=True)
+                if not torch.is_tensor(task_performance[i]):
+                    task_perf = torch.tensor(float(task_performance[i]), device=device, requires_grad=True)
                 else:
-                    img_rel_value = float(img_relevance)
+                    task_perf = task_performance[i].to(device)
 
-                if torch.is_tensor(text_relevance):
-                    text_rel_value = text_relevance.item() if text_relevance.dim() == 0 else text_relevance.flatten()[
-                        0].item()
-                else:
-                    text_rel_value = float(text_relevance)
+                # 计算平均相关性
+                avg_relevance = (img_relevance + text_relevance) / 2
 
-                # 转换为张量并确保在正确设备上
-                avg_relevance = torch.tensor((img_rel_value + text_rel_value) / 2, device=device, requires_grad=True)
+                # MSE损失
+                relevance_performance_loss = (avg_relevance - task_perf) ** 2
+                total_loss = total_loss + relevance_performance_loss
 
-                # 确保task_performance在正确设备上并提取标量
-                if torch.is_tensor(task_performance[count]):
-                    task_perf_value = task_performance[count].item() if task_performance[count].dim() == 0 else \
-                    task_performance[count].flatten()[0].item()
-                else:
-                    task_perf_value = float(task_performance[count])
-
-                task_perf_tensor = torch.tensor(task_perf_value, device=device, requires_grad=True)
-
-                # 计算MSE损失
-                relevance_performance_loss = F.mse_loss(avg_relevance.unsqueeze(0), task_perf_tensor.unsqueeze(0))
-                quality_loss = quality_loss + relevance_performance_loss
-
-            # 2. 生成置信度应该与特征相似度一致
+            # 2. 生成置信度应该合理
             img_confidence = quality['image_quality']['generation_confidence']
             text_confidence = quality['text_quality']['generation_confidence']
 
-            # 安全提取置信度值
-            if torch.is_tensor(img_confidence):
-                img_conf_value = img_confidence.item() if img_confidence.dim() == 0 else img_confidence.flatten()[
-                    0].item()
-            else:
-                img_conf_value = float(img_confidence)
+            # 确保置信度是张量
+            if not torch.is_tensor(img_confidence):
+                img_confidence = torch.tensor(float(img_confidence), device=device, requires_grad=True)
+            if not torch.is_tensor(text_confidence):
+                text_confidence = torch.tensor(float(text_confidence), device=device, requires_grad=True)
 
-            if torch.is_tensor(text_confidence):
-                text_conf_value = text_confidence.item() if text_confidence.dim() == 0 else text_confidence.flatten()[
-                    0].item()
-            else:
-                text_conf_value = float(text_confidence)
-
-            # 转换为张量
-            avg_confidence = torch.tensor((img_conf_value + text_conf_value) / 2, device=device, requires_grad=True)
-
-            # 高置信度应该对应高质量特征
-            confidence_consistency_loss = F.relu(torch.tensor(0.8, device=device) - avg_confidence)
-            quality_loss = quality_loss + confidence_consistency_loss
+            # 高置信度的正则化损失
+            confidence_reg_loss = F.relu(torch.tensor(0.8, device=device) - img_confidence) + \
+                                  F.relu(torch.tensor(0.8, device=device) - text_confidence)
+            total_loss = total_loss + confidence_reg_loss
 
             count += 1
 
         # 确保返回正确的张量
         if count > 0:
-            return quality_loss / count
+            return total_loss / count
         else:
             return torch.tensor(0.0, device=device, requires_grad=True)
