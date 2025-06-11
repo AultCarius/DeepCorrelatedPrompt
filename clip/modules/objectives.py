@@ -335,111 +335,80 @@ def compute_hatememes(pl_module, batch):
     return ret
 
 
-# clip/modules/objectives.py 中新增的质量感知损失函数
-
-def compute_objective_quality_loss(quality_scores, image_features, text_features,
-                                   enhanced_image_features, enhanced_text_features,
-                                   missing_type, current_task_performance):
+def compute_objective_quality_loss(quality_scores, current_task_performance,
+                                   image_features=None, text_features=None,
+                                   enhanced_image_features=None, enhanced_text_features=None,
+                                   missing_type=None):
     """
-    更新版：适配新的质量分数结构。
+    【修复版】质量感知损失函数
     """
+    if not quality_scores or current_task_performance is None:
+        return torch.tensor(0.0, requires_grad=True)
 
-    for q in quality_scores:
-        for k1 in ['image_quality', 'text_quality']:
-            for k2 in ['task_contribution', 'representation_quality', 'intrinsic_quality', 'generation_confidence']:
-                v = q[k1][k2]
-                if not torch.isfinite(v):
-                    print(f"[NaN Detect] {k1}.{k2} = {v}")
-        if not torch.isfinite(q['cross_modal_consistency']):
-            print(f"[NaN Detect] cross_modal_consistency = {q['cross_modal_consistency']}")
-        if 'overall_uncertainty' in q and not torch.isfinite(q['overall_uncertainty']):
-            print(f"[NaN Detect] overall_uncertainty = {q['overall_uncertainty']}")
-
-    task_correlation_loss = 0.0
-    if current_task_performance is not None:
-        for i, quality in enumerate(quality_scores):
-            # 新的质量结构下，我们使用 image 和 text 的 task_contribution + cross_modal_consistency 来表示整体质量
-            overall_quality = (
-                quality['image_quality']['task_contribution'] +
-                quality['text_quality']['task_contribution'] +
-                quality['cross_modal_consistency']
-            ) / 3
-
-            task_correlation_loss += F.relu(0.1 - overall_quality * current_task_performance[i])
-
-    consistency_loss = 0.0
-    for quality in quality_scores:
-        # 图像表示质量高 → 图像内在质量也应高
-        consistency_loss += F.relu(
-            quality['image_quality']['representation_quality'] -
-            quality['image_quality']['intrinsic_quality'] - 0.2
-        )
-
-        # 文本表示质量高 → 文本内在质量也应高
-        consistency_loss += F.relu(
-            quality['text_quality']['representation_quality'] -
-            quality['text_quality']['intrinsic_quality'] - 0.2
-        )
-
-        # 图文模态的一致性高 → 图像和文本的生成置信度也应高
-        consistency_loss += F.relu(
-            quality['cross_modal_consistency'] -
-            quality['image_quality']['generation_confidence'] - 0.1
-        )
-        consistency_loss += F.relu(
-            quality['cross_modal_consistency'] -
-            quality['text_quality']['generation_confidence'] - 0.1
-        )
-
-    physics_loss = 0.0
+    device = current_task_performance.device
     batch_size = len(quality_scores)
-    if batch_size > 1:
-        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
-        missing_indices = [i for i, mt in enumerate(missing_type) if mt != 0]
 
-        if len(complete_indices) > 0 and len(missing_indices) > 0:
-            complete_qualities = torch.stack([
-                (quality_scores[i]['image_quality']['intrinsic_quality'] +
-                 quality_scores[i]['text_quality']['intrinsic_quality'] +
-                 quality_scores[i]['cross_modal_consistency']) / 3
-                for i in complete_indices
-            ])
-            missing_qualities = torch.stack([
-                (quality_scores[i]['image_quality']['intrinsic_quality'] +
-                 quality_scores[i]['text_quality']['intrinsic_quality'] +
-                 quality_scores[i]['cross_modal_consistency']) / 3
-                for i in missing_indices
-            ])
-            physics_loss += F.relu(missing_qualities.mean() - complete_qualities.mean() + 0.1)
+    try:
+        # 验证输入
+        for i, q in enumerate(quality_scores):
+            if not isinstance(q, dict):
+                continue
 
-    distance_consistency_loss = 0.0
-    for i, quality in enumerate(quality_scores):
-        if missing_type[i] == 1:  # 缺失文本
-            text_distance = F.mse_loss(text_features[i], enhanced_text_features[i])
-            confidence = quality['text_quality']['generation_confidence']
-            distance_consistency_loss += F.mse_loss(1.0 - text_distance, confidence)
+            for modality in ['image_quality', 'text_quality']:
+                if modality in q:
+                    for metric_name, metric_value in q[modality].items():
+                        if isinstance(metric_value, torch.Tensor) and not torch.isfinite(metric_value):
+                            print(f"[NaN Detect] {modality}.{metric_name} = {metric_value} at batch {i}")
+                            q[modality][metric_name] = torch.tensor(0.5, device=device)
 
-        elif missing_type[i] == 2:  # 缺失图像
-            img_distance = F.mse_loss(image_features[i], enhanced_image_features[i])
-            confidence = quality['image_quality']['generation_confidence']
-            distance_consistency_loss += F.mse_loss(1.0 - img_distance, confidence)
+        # 1. 质量预测与任务性能一致性损失
+        predicted_quality = []
 
-    info_theory_loss = 0.0
-    for quality in quality_scores:
-        uncertainty = quality['overall_uncertainty']
-        consistency = quality['cross_modal_consistency']
-        contradiction_penalty = uncertainty * consistency
-        info_theory_loss += contradiction_penalty
+        for i, quality_score in enumerate(quality_scores):
+            if isinstance(quality_score, dict):
+                img_task_contrib = quality_score.get('image_quality', {}).get('task_contribution', 0.5)
+                text_task_contrib = quality_score.get('text_quality', {}).get('task_contribution', 0.5)
 
-    total_quality_loss = (
-        0.3 * task_correlation_loss +
-        0.25 * consistency_loss +
-        0.2 * physics_loss +
-        0.15 * distance_consistency_loss +
-        0.1 * info_theory_loss
-    ) / max(len(quality_scores), 1)
+                # 转换为标量
+                if isinstance(img_task_contrib, torch.Tensor):
+                    img_task_contrib = img_task_contrib.item()
+                if isinstance(text_task_contrib, torch.Tensor):
+                    text_task_contrib = text_task_contrib.item()
 
-    return total_quality_loss
+                # 根据缺失类型计算整体质量
+                miss_type = missing_type[i] if missing_type and i < len(missing_type) else 0
+                if miss_type == 1:  # 缺失文本
+                    overall_quality = img_task_contrib
+                elif miss_type == 2:  # 缺失图像
+                    overall_quality = text_task_contrib
+                else:  # 完整样本
+                    overall_quality = (img_task_contrib + text_task_contrib) / 2
+
+                predicted_quality.append(overall_quality)
+            else:
+                predicted_quality.append(0.5)
+
+        predicted_quality = torch.tensor(predicted_quality, device=device, requires_grad=True)
+
+        # 确保维度匹配
+        if predicted_quality.size(0) != current_task_performance.size(0):
+            min_size = min(predicted_quality.size(0), current_task_performance.size(0))
+            predicted_quality = predicted_quality[:min_size]
+            current_task_performance = current_task_performance[:min_size]
+
+        # 计算一致性损失
+        consistency_loss = F.mse_loss(predicted_quality, current_task_performance)
+
+        # 2. 质量稳定性损失 - 防止质量预测过于极端
+        stability_loss = torch.mean(torch.abs(predicted_quality - 0.5)) * 0.1
+
+        total_loss = consistency_loss + stability_loss
+
+        return total_loss
+
+    except Exception as e:
+        print(f"Error in objective quality loss computation: {e}")
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 
@@ -471,47 +440,32 @@ def compute_objective_quality_loss(quality_scores, image_features, text_features
 #         print("[NaN Detect] performance_score contains NaN:", performance_score)
 #
 #     return performance_score.clamp(0.1, 0.9)
-def extract_task_performance_mmimdb(mmimdb_logits, mmimdb_labels):
-    if mmimdb_logits is None:
-        return None
-
+def extract_task_performance_mmimdb(logits, labels):
+    """
+    提取MMIMDb任务性能指标
+    """
     with torch.no_grad():
-        probs = torch.sigmoid(mmimdb_logits)
+        predictions = torch.sigmoid(logits) > 0.5
 
-        # 转换标签格式
-        if isinstance(mmimdb_labels, list):
-            labels = torch.tensor(mmimdb_labels).float().to(probs.device)
-        else:
-            labels = mmimdb_labels.float()
+        # 计算F1分数
+        tp = (predictions * labels).sum(dim=1).float()
+        fp = (predictions * (1 - labels)).sum(dim=1).float()
+        fn = ((1 - predictions) * labels).sum(dim=1).float()
 
-        # 计算样本级别的F1分数或准确率
-        preds = (probs > 0.5).float()
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-        # 计算每个样本的Jaccard相似度（适合多标签）
-        intersection = (preds * labels).sum(dim=-1)
-        union = (preds + labels).clamp(max=1).sum(dim=-1)
-        jaccard = intersection / (union + 1e-8)
-
-        # 或者计算标签预测的平均准确率
-        correct = (preds == labels).float().mean(dim=-1)
-
-        # 结合两个指标
-        performance_score = 0.7 * jaccard + 0.3 * correct
-
-    return torch.clamp(performance_score, 0.1, 0.9)
+        return f1
 
 def compute_enhanced_mmimdb(pl_module, batch):
     """
-    增强版的MMIMDb计算，集成质量感知损失
+
     """
     phase = "train" if pl_module.training else "val"
 
     # 1. 标准的MMIMDb前向传播
-    if phase == "train":
-        infer = pl_module.infer(batch)
-    else:
-        infer = pl_module.infer(batch)
-
+    infer = pl_module.infer(batch)
     imgcls_logits = pl_module.mmimdb_classifier(infer["cls_feats"])
     imgcls_labels = batch["label"]
     imgcls_labels = torch.tensor(imgcls_labels).to(pl_module.device).float()
@@ -519,51 +473,64 @@ def compute_enhanced_mmimdb(pl_module, batch):
     # 2. 主要的分类损失
     mmimdb_loss = F.binary_cross_entropy_with_logits(imgcls_logits, imgcls_labels)
 
-    # 3. 【新增】质量感知损失
-    quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
+    # 3. 【修复】质量感知损失 - 只在训练时且有质量结果时计算
+    quality_losses = {}
 
-    # 获取当前epoch
-    current_epoch = pl_module.current_epoch
+    if phase == "train":
+        # 3.1 增强质量一致性损失
+        enhanced_quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
+        if (hasattr(pl_module.model, 'cached_quality_results') and
+            pl_module.model.cached_quality_results):
+            try:
+                enhanced_quality_loss = compute_enhanced_quality_consistency_loss(
+                    pl_module.model.cached_quality_results,
+                    imgcls_logits,
+                    imgcls_labels,
+                    batch["missing_type"]
+                )
+                quality_losses['mmimdb_enhanced_quality_loss'] = enhanced_quality_loss
 
-    if (current_epoch >= 2 and
-            hasattr(pl_module.model, 'last_quality_scores') and
-            pl_module.model.last_quality_scores and
-            phase == "train"):  # 只在训练时计算质量损失
+                if enhanced_quality_loss.item() > 0:
+                    pl_module.log(f"mmimdb/{phase}/enhanced_quality_loss", enhanced_quality_loss)
+            except Exception as e:
+                print(f"Warning: Enhanced quality loss computation failed: {e}")
+                enhanced_quality_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
 
-        # 提取任务性能指标
-        task_performance = extract_task_performance_mmimdb(imgcls_logits, imgcls_labels)
+        # 3.2 预测器训练损失
+        predictor_training_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
+        if (hasattr(pl_module.model, 'cached_quality_results') and
+            pl_module.model.cached_quality_results):
+            try:
+                total_predictor_loss = 0.0
+                count = 0
+                for quality_result in pl_module.model.cached_quality_results:
+                    predictor_loss = quality_result.get('predictor_loss', 0)
+                    if isinstance(predictor_loss, torch.Tensor) and predictor_loss.requires_grad:
+                        total_predictor_loss += predictor_loss
+                        count += 1
 
-        # 获取必要的特征（需要在model中保存）
-        image_features = getattr(pl_module.model, 'last_image_features', None)
-        text_features = getattr(pl_module.model, 'last_text_features', None)
-        enhanced_image = getattr(pl_module.model, 'last_enhanced_image_features', None)
-        enhanced_text = getattr(pl_module.model, 'last_enhanced_text_features', None)
+                if count > 0:
+                    predictor_training_loss = total_predictor_loss / count
+                    quality_losses['mmimdb_predictor_loss'] = predictor_training_loss
 
-        # 计算质量损失
-        quality_loss = compute_objective_quality_loss(
-            quality_scores=pl_module.model.last_quality_scores,
-            current_task_performance=task_performance,
-            image_features=image_features,
-            text_features=text_features,
-            enhanced_image_features=enhanced_image,
-            enhanced_text_features=enhanced_text,
-            missing_type=batch["missing_type"]
-        )
+                    if predictor_training_loss.item() > 0:
+                        pl_module.log(f"mmimdb/{phase}/predictor_loss", predictor_training_loss)
+            except Exception as e:
+                print(f"Warning: Predictor loss computation failed: {e}")
+                predictor_training_loss = torch.tensor(0.0, device=pl_module.device, requires_grad=True)
 
-    # 4. 返回结果
+    # 4. 【修复】构建返回结果 - 确保所有损失都被正确处理
     ret = {
         "mmimdb_loss": mmimdb_loss,
-        "mmimdb_quality_loss": quality_loss,  # 单独记录质量损失
         "mmimdb_logits": imgcls_logits,
         "mmimdb_labels": imgcls_labels,
     }
 
+    # 添加质量损失到返回结果
+    ret.update(quality_losses)
+
     # 5. 记录指标
     loss = getattr(pl_module, f"{phase}_mmimdb_loss")(ret["mmimdb_loss"])
-
-    # 记录质量损失
-    if quality_loss.item() > 0:
-        pl_module.log(f"mmimdb/{phase}/quality_loss", quality_loss)
 
     f1_scores = getattr(pl_module, f"{phase}_mmimdb_F1_scores")(
         ret["mmimdb_logits"], ret["mmimdb_labels"]
@@ -641,134 +608,84 @@ def compute_enhanced_mmimdb_v2(pl_module, batch):
 
 def compute_enhanced_quality_consistency_loss(quality_results, task_logits, task_labels, missing_type):
     """
-    计算增强的质量一致性损失
-
-    Args:
-        quality_results: List[Dict] 来自EnhancedQualityEstimator的质量结果
-        task_logits: [batch_size, num_classes] 任务预测logits
-        task_labels: [batch_size, num_classes] 任务标签
-        missing_type: [batch_size] 缺失类型
-
-    Returns:
-        质量一致性损失
+    【修复版】计算增强的质量一致性损失
     """
     if not quality_results:
         return torch.tensor(0.0, requires_grad=True)
 
-    batch_size = len(quality_results)
     device = task_logits.device
+    batch_size = len(quality_results)
 
-    # 1. 基于任务性能的质量验证
-    task_performance_loss = 0.0
+    # 防止batch_size不匹配
+    if batch_size != task_logits.size(0):
+        print(f"Warning: Quality results batch size ({batch_size}) != logits batch size ({task_logits.size(0)})")
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # 计算每个样本的任务性能指标
-    with torch.no_grad():
-        task_probs = torch.sigmoid(task_logits)  # 多标签分类
-        # 计算预测置信度作为性能指标
-        prediction_confidence = torch.max(task_probs, dim=-1)[0]
+    try:
+        # 1. 计算任务性能（F1分数作为性能指标）
+        with torch.no_grad():
+            task_predictions = torch.sigmoid(task_logits) > 0.5
+            task_performance = []
 
-        # 方法2：预测准确率（逐标签比较，取平均）
-        preds = (task_probs > 0.5).float()
-        correct = (preds == task_labels).float()
-        prediction_accuracy = correct.mean(dim=-1)  # shape: [B]
+            for i in range(batch_size):
+                # 计算每个样本的F1分数
+                pred = task_predictions[i].float()
+                label = task_labels[i].float()
 
-        # 综合任务性能分数
-        task_performance = 0.7 * prediction_confidence + 0.3 * prediction_accuracy
+                # 避免除零错误
+                tp = (pred * label).sum()
+                fp = (pred * (1 - label)).sum()
+                fn = ((1 - pred) * label).sum()
 
-    for i, quality_result in enumerate(quality_results):
-        # 获取质量分数
-        overall_img_quality = quality_result['overall_img_quality']
-        overall_text_quality = quality_result['overall_text_quality']
-        overall_confidence = quality_result['overall_confidence']
+                precision = tp / (tp + fp + 1e-8)
+                recall = tp / (tp + fn + 1e-8)
+                f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-        # 综合质量分数
-        if missing_type[i] == 0:  # 完整模态
-            combined_quality = (overall_img_quality + overall_text_quality) / 2
-        elif missing_type[i] == 1:  # 缺失文本
-            combined_quality = overall_img_quality * 0.8  # 降权
-        elif missing_type[i] == 2:  # 缺失图像
-            combined_quality = overall_text_quality * 0.8  # 降权
-        else:
-            combined_quality = (overall_img_quality + overall_text_quality) / 4  # 严重降权
+                task_performance.append(f1.item())
 
-        # 质量与任务性能的一致性损失
-        # 期望：高质量样本有高任务性能，低质量样本有低任务性能
-        performance_quality_gap = torch.abs(combined_quality - task_performance[i])
-        task_performance_loss += performance_quality_gap
+            task_performance = torch.tensor(task_performance, device=device)
 
-    task_performance_loss = task_performance_loss / batch_size
+        # 2. 提取质量预测
+        predicted_quality = []
+        for i, quality_result in enumerate(quality_results):
+            if 'image_quality' in quality_result and 'text_quality' in quality_result:
+                img_qual = quality_result['image_quality'].get('task_contribution', 0.5)
+                text_qual = quality_result['text_quality'].get('task_contribution', 0.5)
 
-    # 2. 质量内部一致性损失
-    internal_consistency_loss = 0.0
+                # 转换为tensor
+                if isinstance(img_qual, torch.Tensor):
+                    img_qual = img_qual.item()
+                if isinstance(text_qual, torch.Tensor):
+                    text_qual = text_qual.item()
 
-    for quality_result in quality_results:
-        # 数学质量与任务相关性的一致性
-        img_math_quality = quality_result['img_intrinsic_quality']['norm_stability']
-        text_math_quality = quality_result['text_intrinsic_quality']['norm_stability']
+                # 根据缺失类型选择质量
+                miss_type = missing_type[i] if i < len(missing_type) else 0
+                if miss_type == 1:  # 缺失文本，使用图像质量
+                    overall_quality = img_qual
+                elif miss_type == 2:  # 缺失图像，使用文本质量
+                    overall_quality = text_qual
+                else:  # 完整样本，使用平均质量
+                    overall_quality = (img_qual + text_qual) / 2
 
-        # 获取任务相关性
-        task_relevance = quality_result['task_relevance']
-        if 'img_task_relevance' in task_relevance:
-            img_task_relevance = task_relevance['img_task_relevance']
-            text_task_relevance = task_relevance['text_task_relevance']
-        else:
-            img_task_relevance = task_relevance['img_gradient_magnitude']
-            text_task_relevance = task_relevance['text_gradient_magnitude']
-
-        # 内部一致性：数学质量高的特征，任务相关性也应该相对较高
-        img_consistency = torch.abs(img_math_quality - img_task_relevance)
-        text_consistency = torch.abs(text_math_quality - text_task_relevance)
-
-        internal_consistency_loss += (img_consistency + text_consistency) / 2
-
-    internal_consistency_loss = internal_consistency_loss / len(quality_results)
-
-    # 3. 模态平衡损失
-    modality_balance_loss = 0.0
-
-    complete_samples = [i for i, mt in enumerate(missing_type) if mt == 0]
-    missing_samples = [i for i, mt in enumerate(missing_type) if mt != 0]
-
-    if len(complete_samples) > 0 and len(missing_samples) > 0:
-        # 完整样本的平均质量应该高于缺失样本
-        complete_qualities = []
-        missing_qualities = []
-
-        for i in complete_samples:
-            quality_result = quality_results[i]
-            complete_quality = (
-                                       quality_result['overall_img_quality'] +
-                                       quality_result['overall_text_quality']
-                               ) / 2
-            complete_qualities.append(complete_quality)
-
-        for i in missing_samples:
-            quality_result = quality_results[i]
-            if missing_type[i] == 1:  # 缺失文本
-                missing_quality = quality_result['overall_img_quality']
-            elif missing_type[i] == 2:  # 缺失图像
-                missing_quality = quality_result['overall_text_quality']
+                predicted_quality.append(overall_quality)
             else:
-                missing_quality = (
-                                          quality_result['overall_img_quality'] +
-                                          quality_result['overall_text_quality']
-                                  ) / 2
-            missing_qualities.append(missing_quality)
+                predicted_quality.append(0.5)  # 默认中等质量
 
-        complete_avg = torch.stack(complete_qualities).mean()
-        missing_avg = torch.stack(missing_qualities).mean()
+        predicted_quality = torch.tensor(predicted_quality, device=device, requires_grad=True)
 
-        # 期望完整样本质量高于缺失样本
-        modality_balance_loss = F.relu(missing_avg - complete_avg + 0.1)
+        # 3. 计算质量一致性损失
+        quality_consistency_loss = F.mse_loss(predicted_quality, task_performance)
 
-    # 4. 总的质量一致性损失
-    total_loss = (
-            0.4 * task_performance_loss +
-            0.3 * internal_consistency_loss +
-            0.3 * modality_balance_loss
-    )
+        # 4. 添加正则化项防止质量预测过于极端
+        quality_regularization = torch.mean(torch.abs(predicted_quality - 0.5)) * 0.1
 
-    return total_loss
+        total_loss = quality_consistency_loss + quality_regularization
+
+        return total_loss
+
+    except Exception as e:
+        print(f"Error in quality consistency loss computation: {e}")
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def compute_gradient_quality_alignment_loss(quality_results, model_features):

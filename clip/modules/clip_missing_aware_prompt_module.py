@@ -684,7 +684,7 @@ class CustomCLIP(nn.Module):
 
         # 【新增】质量提示控制
         self.quality_prompts_enabled = True
-        self.quality_prompt_warmup_epochs = 3  # 前3个epoch不使用质量提示
+        self.quality_prompt_warmup_epochs = 0  # 前3个epoch不使用质量提示
 
 
     def set_quality_prompts_enabled(self, enabled: bool):
@@ -726,12 +726,13 @@ class CustomCLIP(nn.Module):
             missing_type
         )
         self.cached_quality_scores = quality_scores
-
+        # print(self.quality_prompts_enabled,current_epoch,self.quality_prompt_warmup_epochs)
         # 4. 【新增】第二阶段：质量感知提示重新编码（可选）
         if (self.quality_prompts_enabled and
-                current_epoch >= self.quality_prompt_warmup_epochs and
-                self.training):
+                current_epoch >= self.quality_prompt_warmup_epochs):
             # 使用质量信息重新生成提示
+            # print("质量增强提示开启")
+
             quality_enhanced_prompts_image, quality_enhanced_prompts_text = self.prompt_learner(
                 missing_type, quality_scores
             )
@@ -801,22 +802,16 @@ class CLIPransformerSS(pl.LightningModule):
         self.quality_loss_weight = config.get('quality_loss_weight', 0.01)  # 【新增】
         self.predictor_loss_weight = config.get('predictor_loss_weight', 0.005)  # 预测器损失权重
         # 【新增】训练策略控制
-        self.warmup_epochs = config.get('warmup_epochs', 5)
+        self.warmup_epochs = config.get('warmup_epochs', 1)
         self.quality_aware_epochs = config.get('quality_aware_epochs', 10)
-
-        # 【新增】生成器相关损失权重
-        self.contrastive_loss_weight = config.get('contrastive_loss_weight', 0.1)
-        self.generation_consistency_weight = config.get('generation_consistency_weight', 0.05)
-        self.cycle_loss_weight = config.get('cycle_loss_weight', 0.02)
-        self.generation_quality_weight = config.get('generation_quality_weight', 0.01)
 
 
         # 【新增】质量相关损失权重
         self.contrastive_loss_weight = config.get('contrastive_loss_weight', 0.1)
-        self.generation_consistency_weight = config.get('generation_consistency_weight', 0.05)
-        self.cycle_loss_weight = config.get('cycle_loss_weight', 0.02)
-        self.generation_quality_weight = config.get('generation_quality_weight', 0.01)
-        self.quality_prediction_weight = config.get('quality_prediction_weight', 0.02)  # 【新增】
+        self.generation_consistency_weight = config.get('generation_consistency_weight', 0.1)
+        self.cycle_loss_weight = config.get('cycle_loss_weight', 0.1)
+        self.generation_quality_weight = config.get('generation_quality_weight', 0.1)
+        self.quality_prediction_weight = config.get('quality_prediction_weight', 0.1)  # 【新增】
 
         # 自适应损失权重调度器
         self.loss_scheduler = self.create_loss_scheduler()
@@ -940,51 +935,152 @@ class CLIPransformerSS(pl.LightningModule):
         return ret
 
     def training_step(self, batch, batch_idx):
+        """【调试版】training_step - 添加详细调试信息"""
         clip_utils.set_task(self)
-        # 【新增】提取任务性能指标
+
+        # 【调试1】打印批次基本信息
+        if batch_idx % 200 == 0:  # 每20个batch打印一次
+            print(f"\n=== Batch {batch_idx} Debug Info ===")
+            print(f"Missing types: {batch['missing_type']}")
+            print(f"Batch size: {len(batch['missing_type'])}")
+
+            # 统计missing_type分布
+            from collections import Counter
+            missing_stats = Counter(batch['missing_type'])
+            print(f"Missing type distribution: {dict(missing_stats)}")
+
         self._extract_task_performance_from_batch(batch)
 
+        # 前向传播
         output = self(batch)
 
+        # 【调试2】检查forward输出
+        if batch_idx % 200 == 0:
+            print(f"Forward output keys: {list(output.keys())}")
+            for k, v in output.items():
+                if 'loss' in k and hasattr(v, 'item'):
+                    print(f"  {k}: {v.item():.6f}")
 
-        # 【新增】提取任务性能指标
-        self._extract_task_performance_from_batch(batch)
+        # 主任务损失计算
+        main_task_losses = {}
+        for k, v in output.items():
+            if ("loss" in k and
+                    "generation" not in k and
+                    "quality" not in k and
+                    "enhanced" not in k and
+                    "predictor" not in k):
+                main_task_losses[k] = v
 
-        # 主任务损失
-        main_loss = sum([v for k, v in output.items() if "loss" in k and "generation" not in k])
+        main_loss = sum(main_task_losses.values()) if main_task_losses else torch.tensor(0.0, device=self.device,
+                                                                                         requires_grad=True)
 
-        # 【新增】生成器相关损失
+        # 【调试3】检查缓存数据
+        cached_data = self.model.get_cached_data_for_loss_computation()
+        if batch_idx % 200 == 0:
+            print(f"Cached data structure:")
+            print(f"  Keys: {list(cached_data.keys())}")
+
+            # 检查features
+            features = cached_data.get('features', {})
+            if features:
+                print(f"  Features keys: {list(features.keys())}")
+                for fk, fv in features.items():
+                    if hasattr(fv, 'shape'):
+                        print(f"    {fk}: shape {fv.shape}")
+                    else:
+                        print(f"    {fk}: {type(fv)}")
+            else:
+                print("  ❌ Features is empty!")
+
+            # 检查quality_scores
+            quality_scores = cached_data.get('quality_scores')
+            if quality_scores:
+                print(f"  Quality scores: {len(quality_scores)} samples")
+                if len(quality_scores) > 0:
+                    print(f"    First sample keys: {list(quality_scores[0].keys())}")
+            else:
+                print("  ❌ Quality scores is empty!")
+
+        # 【调试4】检查生成器损失计算
+        print(f"Computing generation losses...") if batch_idx % 200 == 0 else None
         generation_losses = self._compute_generation_losses()
-        # 【新增】质量预测损失
+
+        if batch_idx % 200 == 0:
+            print(f"Generation losses:")
+            for k, v in generation_losses.items():
+                print(f"  {k}: {v.item():.6f}")
+                if v.item() == 0.0:
+                    print(f"    ❌ {k} is ZERO!")
+
+        # 【调试5】检查质量预测损失
+        print(f"Computing quality prediction loss...") if batch_idx % 200 == 0 else None
         quality_prediction_loss = self._compute_quality_prediction_loss()
+
+        if batch_idx % 200 == 0:
+            print(f"Quality prediction loss: {quality_prediction_loss.item():.6f}")
+            if quality_prediction_loss.item() == 0.0:
+                print(f"    ❌ Quality prediction loss is ZERO!")
+
+        # 【调试6】检查损失权重
+        if batch_idx % 200 == 0:
+            print(f"Loss weights:")
+            print(f"  contrastive_loss_weight: {self.contrastive_loss_weight}")
+            print(f"  generation_consistency_weight: {self.generation_consistency_weight}")
+            print(f"  cycle_loss_weight: {self.cycle_loss_weight}")
+            print(f"  generation_quality_weight: {self.generation_quality_weight}")
+            print(f"  quality_prediction_weight: {self.quality_prediction_weight}")
+
+        # 总损失计算
         total_loss = main_loss
+        added_losses = []
 
         # 添加生成器损失
-        if generation_losses['contrastive_loss'] > 0:
-            total_loss += self.contrastive_loss_weight * generation_losses['contrastive_loss']
+        if generation_losses['contrastive_loss'].item() > 0:
+            weighted_loss = self.contrastive_loss_weight * generation_losses['contrastive_loss']
+            total_loss += weighted_loss
+            added_losses.append(f"contrastive: {weighted_loss.item():.6f}")
             self.log("train/contrastive_loss", generation_losses['contrastive_loss'])
 
-        if generation_losses['generation_consistency_loss'] > 0:
-            total_loss += self.generation_consistency_weight * generation_losses['generation_consistency_loss']
+        if generation_losses['generation_consistency_loss'].item() > 0:
+            weighted_loss = self.generation_consistency_weight * generation_losses['generation_consistency_loss']
+            total_loss += weighted_loss
+            added_losses.append(f"gen_consistency: {weighted_loss.item():.6f}")
             self.log("train/generation_consistency_loss", generation_losses['generation_consistency_loss'])
 
-        if generation_losses['cycle_consistency_loss'] > 0:
-            total_loss += self.cycle_loss_weight * generation_losses['cycle_consistency_loss']
+        if generation_losses['cycle_consistency_loss'].item() > 0:
+            weighted_loss = self.cycle_loss_weight * generation_losses['cycle_consistency_loss']
+            total_loss += weighted_loss
+            added_losses.append(f"cycle: {weighted_loss.item():.6f}")
             self.log("train/cycle_consistency_loss", generation_losses['cycle_consistency_loss'])
 
-        if generation_losses['generation_quality_loss'] > 0:
-            total_loss += self.generation_quality_weight * generation_losses['generation_quality_loss']
+        if generation_losses['generation_quality_loss'].item() > 0:
+            weighted_loss = self.generation_quality_weight * generation_losses['generation_quality_loss']
+            total_loss += weighted_loss
+            added_losses.append(f"gen_quality: {weighted_loss.item():.6f}")
             self.log("train/generation_quality_loss", generation_losses['generation_quality_loss'])
 
-        # 【新增】质量预测损失
-        if quality_prediction_loss > 0:
-            total_loss += self.quality_prediction_weight * quality_prediction_loss
+        if quality_prediction_loss.item() > 0:
+            weighted_loss = self.quality_prediction_weight * quality_prediction_loss
+            total_loss += weighted_loss
+            added_losses.append(f"quality_pred: {weighted_loss.item():.6f}")
             self.log("train/quality_prediction_loss", quality_prediction_loss)
 
         # 记录损失
         self.log("train/main_loss", main_loss)
         self.log("train/total_loss", total_loss)
-        self.log("train/epoch", float(self.current_epoch))
+
+        # 【调试7】最终总结
+        if batch_idx % 200 == 0:
+            print(f"Loss Summary:")
+            print(f"  Main loss: {main_loss.item():.6f}")
+            print(f"  Added losses: {added_losses if added_losses else 'None'}")
+            print(f"  Total loss: {total_loss.item():.6f}")
+            print(f"  Difference: {(total_loss - main_loss).item():.6f}")
+
+            if abs(total_loss.item() - main_loss.item()) < 1e-6:
+                print("  ❌ WARNING: Total loss equals main loss! No additional losses added.")
+
+            print("=" * 50)
 
         return total_loss
 
@@ -998,10 +1094,6 @@ class CLIPransformerSS(pl.LightningModule):
 
     def validation_epoch_end(self, outs):
         clip_utils.epoch_wrapup(self)
-
-    #         print('missing_img:', self.missing_img_prompt[0,0:3,0:8])
-    #         print('missing_text:', self.missing_text_prompt[0,0:3,0:8])
-    #         print('complete:', self.complete_prompt[0,0:3,0:8])
 
     def test_step(self, batch, batch_idx):
         clip_utils.set_task(self)
@@ -1104,34 +1196,79 @@ class CLIPransformerSS(pl.LightningModule):
             batch_size = len(batch["missing_type"])
             self._current_task_performance = torch.ones(batch_size).to(self.device) * 0.6
 
-
     def _compute_generation_losses(self):
-        """
-        【新增】计算生成器相关的损失
-        """
+        """【调试版】计算生成器相关的损失"""
         # 获取缓存数据
         cached_data = self.model.get_cached_data_for_loss_computation()
 
-        if not cached_data['features']:
-            return {
-                'contrastive_loss': torch.tensor(0.0, requires_grad=True),
-                'generation_consistency_loss': torch.tensor(0.0, requires_grad=True),
-                'cycle_consistency_loss': torch.tensor(0.0, requires_grad=True),
-                'generation_quality_loss': torch.tensor(0.0, requires_grad=True)
-            }
+        # 详细检查缓存数据
+        # print(f"  _compute_generation_losses debug:")
+        # print(f"    cached_data type: {type(cached_data)}")
+        # print(f"    cached_data keys: {list(cached_data.keys()) if cached_data else 'None'}")
 
-        cached_features = cached_data['features']
-        missing_type = self._current_missing_type if self._current_missing_type is not None else [0] * cached_features[
-            'original_image_features'].size(0)
+        if not cached_data:
+            print(f"    ❌ cached_data is None or empty!")
+            return self._get_zero_generation_losses()
 
-        # 使用模态生成器计算所有损失
-        generation_losses = self.model.modal_generator.compute_all_generation_losses(
-            cached_features['original_image_features'],
-            cached_features['original_text_features'],
-            missing_type
-        )
+        features = cached_data.get('features')
+        # print(f"    features type: {type(features)}")
+        # print(f"    features keys: {list(features.keys()) if features else 'None'}")
 
-        return generation_losses
+        if not features:
+            print(f"    ❌ features is None or empty!")
+            return self._get_zero_generation_losses()
+
+        # 检查必要的特征是否存在
+        required_features = ['original_image_features', 'original_text_features']
+        for req_feat in required_features:
+            if req_feat not in features:
+                print(f"    ❌ Missing required feature: {req_feat}")
+                return self._get_zero_generation_losses()
+            else:
+                feat_tensor = features[req_feat]
+                # print(f"    {req_feat}: shape {feat_tensor.shape}, device {feat_tensor.device}")
+
+        # 检查missing_type
+        missing_type = getattr(self, '_current_missing_type', None)
+        # print(f"    missing_type: {missing_type}")
+
+        if missing_type is None:
+            batch_size = features['original_image_features'].size(0)
+            missing_type = [0] * batch_size
+            print(f"    Using default missing_type: {missing_type}")
+
+        # 检查modal_generator是否存在
+        if not hasattr(self.model, 'modal_generator') or self.model.modal_generator is None:
+            print(f"    ❌ modal_generator not found!")
+            return self._get_zero_generation_losses()
+
+        # print(f"    modal_generator type: {type(self.model.modal_generator)}")
+
+        try:
+            # 使用模态生成器计算所有损失
+            generation_losses = self.model.modal_generator.compute_all_generation_losses(
+                features['original_image_features'],
+                features['original_text_features'],
+                missing_type
+            )
+
+
+            return generation_losses
+
+        except Exception as e:
+            print(f"    ❌ Error computing generation losses: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._get_zero_generation_losses()
+
+    def _get_zero_generation_losses(self):
+        """返回零损失"""
+        return {
+            'contrastive_loss': torch.tensor(0.0, device=self.device, requires_grad=True),
+            'generation_consistency_loss': torch.tensor(0.0, device=self.device, requires_grad=True),
+            'cycle_consistency_loss': torch.tensor(0.0, device=self.device, requires_grad=True),
+            'generation_quality_loss': torch.tensor(0.0, device=self.device, requires_grad=True)
+        }
 
     def _compute_quality_prediction_loss(self):
         """

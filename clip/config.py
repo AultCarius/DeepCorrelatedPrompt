@@ -101,7 +101,6 @@ def config():
     num_workers = 8
     precision = 16
 
-    # 【新增】模态生成器配置 - 必须在主config中定义
     modal_generator_config = {
         'hidden_size': 512,
         'num_layers': 3,
@@ -109,97 +108,90 @@ def config():
         'dropout': 0.1
     }
 
-    # 【新增】循环一致性损失权重 - 必须在主config中定义
-    # cycle_loss_weight = 0.02
-    # 【新增】质量评估配置
-    quality_estimator_config = {
-        'hidden_size': 512,
-        'fusion_strategy': 'weighted'  # 'weighted' 或 'attention'
-    }
+    # ============================================================================
+    # 核心损失权重配置
+    # ============================================================================
+    cycle_loss_weight = 0.1  # 循环一致性损失权重
+    quality_loss_weight = 0.1  # 质量监督损失权重
+    task_auxiliary_weight = 0.1  # 任务辅助损失权重
 
-    # 【更新】损失权重配置
-    cycle_loss_weight = 0.02  # 循环一致性损失权重
-    quality_loss_weight = 0.01  # 质量一致性损失权重
-    task_auxiliary_weight = 0.1  # 【新增】任务辅助损失权重
+    # 主要损失权重组合
+    main_task_weight = 1.0  # 主任务损失权重
+    predictor_loss_weight = 0.1  # 预测器训练损失权重
+    quality_consistency_weight = 0.01  # 质量一致性损失权重
+    gradient_alignment_weight = 0.01  # 梯度对齐损失权重
 
-    # 【新增】多维度质量评估配置
-    enhanced_quality_config = {
-        'use_geometric_quality': True,  # 几何质量评估
-        'use_information_quality': True,  # 信息论质量评估
-        'use_task_quality': True,  # 任务相关质量评估
-        'use_contrastive_quality': True,  # 对比学习质量评估
-        'use_mathematical_quality': True,  # 数学质量评估
-        'fusion_strategy': 'quality_attention'  # 融合策略
-    }
+    # ============================================================================
+    # 质量评估核心配置
+    # ============================================================================
+    # 基础质量评估
+    quality_estimator_hidden_size = 512
+    quality_estimator_fusion_strategy = 'attention'  # 'weighted' 或 'attention'
 
-    # 【新增】合理质量评估配置
-    reasonable_quality_config = {
-        'importance_weight': 0.1,  # 模态重要性损失权重
-        'authenticity_weight': 0.05,  # 特征真实性损失权重
-        'difficulty_weight': 0.05,  # 任务难度损失权重
-        'use_quality_fusion': True,  # 是否使用质量引导融合
-    }
+    # 增强质量评估
+    use_mathematical_quality = True  # 数学特征质量
+    use_gradient_task_relevance = True  # 基于梯度的任务相关性
+    use_perturbation_analysis = True  # 扰动敏感性分析
+    use_task_relevance_predictor = True  # 任务相关性预测器
+    predictor_hidden_size = 512  # 预测器隐藏层大小
+    quality_aggregator_layers = [8, 16, 4]  # 质量聚合器层配置
 
-    # 【新增】质量监督损失权重
-    quality_loss_weight = 0.01
+    # 质量权重配置
+    importance_weight = 0.1  # 模态重要性损失权重
+    authenticity_weight = 0.05  # 特征真实性损失权重
+    difficulty_weight = 0.05  # 任务难度损失权重
 
-    # 【新增】分阶段训练配置
-    warmup_epochs = 5  # 前5轮只训练基础组件
-    quality_aware_epochs = 10  # 接下来10轮启用质量感知
+    contrastive_loss_weight = 0.01
+    generation_consistency_weight = 0.05
+    cycle_loss_weight = 0.02
+    generation_quality_weight = 0.01
+    quality_prediction_weight = 0.02
+    quality_prompt_warmup_epochs = 5
 
-    # 【新增】质量感知prompt配置
-    quality_aware_prompt_config = {
-        'adaptation_weight_init': 0.1,  # 初始自适应权重
-        'max_iterations': 2,  # 最大迭代次数
-        'early_stop_threshold': 0.01  # 早停阈值
-    }
+    # ============================================================================
+    # 质量感知融合配置
+    # ============================================================================
+    use_quality_guided_enhancement = True  # 质量引导增强
+    use_cross_modal_interaction = True  # 跨模态交互
+    use_adaptive_fusion = True  # 自适应融合
+    use_quality_fusion = True  # 质量引导融合
 
-    # 【新增】增强质量评估配置
-    enhanced_quality_config = {
-        'use_mathematical_quality': True,  # 是否使用数学特征质量
-        'use_gradient_task_relevance': True,  # 是否使用基于梯度的任务相关性
-        'use_perturbation_analysis': True,  # 是否使用扰动敏感性分析
-        'use_task_relevance_predictor': True,  # 是否使用任务相关性预测器
-        'predictor_hidden_size': 512,  # 预测器隐藏层大小
-        'quality_aggregator_layers': [8, 16, 4]  # 质量聚合器层配置
-    }
+    # 融合阈值配置
+    interaction_threshold = 0.5  # 跨模态交互阈值
+    enhancement_threshold = 0.3  # 特征增强阈值
+    fusion_dropout = 0.1  # 融合层dropout
 
-    # 【新增】质量感知融合配置
-    quality_fusion_config = {
-        'use_quality_guided_enhancement': True,  # 是否使用质量引导增强
-        'use_cross_modal_interaction': True,  # 是否使用跨模态交互
-        'use_adaptive_fusion': True,  # 是否使用自适应融合
-        'interaction_threshold': 0.5,  # 跨模态交互阈值
-        'enhancement_threshold': 0.3,  # 特征增强阈值
-        'fusion_dropout': 0.1  # 融合层dropout
-    }
+    # ============================================================================
+    # 训练策略配置
+    # ============================================================================
+    # 分阶段训练
+    warmup_epochs = 2  # 预热轮数 (只训练基础组件)
+    quality_aware_epochs = 10  # 质量感知训练轮数
 
-    # 【更新】损失权重配置
-    loss_weights = {
-        'main_task_weight': 1.0,  # 主任务损失权重
-        'cycle_loss_weight': 0.02,  # 循环一致性损失权重
-        'predictor_loss_weight': 0.005,  # 预测器训练损失权重
-        'quality_consistency_weight': 0.01,  # 质量一致性损失权重
-        'gradient_alignment_weight': 0.002  # 梯度对齐损失权重（可选）
-    }
+    # 训练开关
+    use_enhanced_quality = True  # 使用增强质量评估
+    use_quality_aware_prompts = False  # 使用质量感知prompt
+    enable_gradient_quality = True  # 启用梯度质量分析
+    quality_loss_schedule = 'linear'  # 质量损失调度策略
 
-    # 【新增】训练策略配置
-    training_strategy = {
-        'warmup_epochs': 5,  # 预热轮数
-        'quality_aware_epochs': 10,  # 质量感知训练轮数
-        'use_enhanced_quality': True,  # 是否使用增强质量评估
-        'use_quality_aware_prompts': False,  # 是否使用质量感知prompt
-        'enable_gradient_quality': True,  # 是否启用梯度质量分析
-        'quality_loss_schedule': 'linear'  # 质量损失调度策略
-    }
+    # ============================================================================
+    # 质量感知prompt配置
+    # ============================================================================
+    adaptation_weight_init = 0.1  # 初始自适应权重
+    max_iterations = 2  # 最大迭代次数
+    early_stop_threshold = 0.01  # 早停阈值
 
-    # 【新增】调试和监控配置
-    debug_config = {
-        'log_quality_scores': True,  # 是否记录质量分数
-        'save_quality_analysis': False,  # 是否保存质量分析结果
-        'visualize_fusion_weights': False,  # 是否可视化融合权重
-        'quality_log_interval': 100  # 质量分析日志间隔
-    }
+    # ============================================================================
+    # 调试监控配置
+    # ============================================================================
+    log_quality_scores = True  # 记录质量分数
+    save_quality_analysis = False  # 保存质量分析结果
+    visualize_fusion_weights = False  # 可视化融合权重
+    quality_log_interval = 100  # 质量分析日志间隔
+
+
+
+
 
 
 
