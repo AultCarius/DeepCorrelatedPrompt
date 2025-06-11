@@ -677,8 +677,7 @@ class CustomCLIP(nn.Module):
             hidden_size=512,
             fusion_strategy='adaptive_attention'
         )
-        # 缓存变量，用于损失计算和特征替代
-        # 缓存变量
+
         self.cached_features = {}
         self.cached_generation_info = None
         self.cached_quality_scores = None
@@ -687,12 +686,14 @@ class CustomCLIP(nn.Module):
         self.quality_prompts_enabled = True
         self.quality_prompt_warmup_epochs = 0  # 前3个epoch不使用质量提示
 
+
     def set_quality_prompts_enabled(self, enabled: bool):
         """动态控制质量提示的启用"""
         self.quality_prompts_enabled = enabled
         self.prompt_learner.set_quality_prompts_enabled(enabled)
 
     def forward(self, image, text, missing_type, current_epoch=0):
+
         tokenized_texts = torch.stack([clip.tokenize(tx, context_length=77, truncate=True) for tx in text[0]], 0).to(
             image.get_device()).squeeze(1)
 
@@ -768,6 +769,7 @@ class CustomCLIP(nn.Module):
             'enhanced_text_features': enhanced_text_features,
             'fused_features': fused_features
         }
+
 
         return fused_features
 
@@ -919,9 +921,12 @@ class CLIPransformerSS(pl.LightningModule):
 
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
+
             ret.update(objectives.compute_mmimdb(self, batch))
+
             # ret.update(objectives.compute_enhanced_mmimdb(self, batch))
             # ret.update(objectives.compute_enhanced_mmimdb_v2(self, batch))
+
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -944,7 +949,6 @@ class CLIPransformerSS(pl.LightningModule):
             missing_stats = Counter(batch['missing_type'])
             print(f"Missing type distribution: {dict(missing_stats)}")
 
-        # 提取任务性能指标
         self._extract_task_performance_from_batch(batch)
 
         # 前向传播
@@ -1162,6 +1166,7 @@ class CLIPransformerSS(pl.LightningModule):
             self.model.use_iterative_optimization = True
             self.model.use_quality_aware_prompts = True
 
+
     def _extract_task_performance_from_batch(self, batch):
         """
         【新增】从当前batch提取任务性能指标，用于质量监督
@@ -1317,4 +1322,5 @@ class CLIPransformerSS(pl.LightningModule):
             self.log("quality/avg_img_relevance", sum(img_relevances) / len(img_relevances))
             self.log("quality/avg_text_relevance", sum(text_relevances) / len(text_relevances))
             self.log("quality/avg_overall_confidence", sum(overall_confidences) / len(overall_confidences))
+
 
