@@ -1,339 +1,266 @@
-# clip/modules/improved_modal_generator.py
+# clip/modules/improved_modal_generator.py - 完全重写
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import clip
 
 
 class ImprovedModalGenerator(nn.Module):
-    """改进的模态生成器 - 更好的训练策略和特征替代机制"""
+    """
+    重写版：在原始数据空间进行模态生成
+    核心思路：
+    1. 完整样本训练生成器
+    2. 缺失样本用生成器生成原始数据替换零填充
+    3. 生成的是可以直接输入CLIP编码器的原始数据
+    """
 
-    def __init__(self, hidden_size=512, num_layers=3, num_heads=8, dropout=0.1):
+    def __init__(self, hidden_size=512, num_layers=2, num_heads=8, dropout=0.1):
         super().__init__()
 
-        # 图像→文本生成器
-        self.img_to_text = CrossModalGenerator(hidden_size, num_layers, num_heads, dropout)
-
-        # 文本→图像生成器
-        self.text_to_img = CrossModalGenerator(hidden_size, num_layers, num_heads, dropout)
-
-        # 对比学习头（用于训练）
-        self.contrastive_head_img = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, hidden_size // 4)
+        # === 原始数据空间的生成器 ===
+        # 图像特征 -> 文本tokens (CLIP tokenizer 兼容)
+        self.img_to_text_generator = nn.Sequential(
+            nn.Linear(768, 512),  # 图像编码维度到中间维度
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, 77),  # 输出77个token位置的logits
+            nn.Tanh()  # 限制输出范围
         )
 
-        self.contrastive_head_text = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, hidden_size // 4)
+        # 文本特征 -> 图像pixels
+        self.text_to_img_generator = nn.Sequential(
+            nn.Linear(512, 1024),  # 文本编码维度到中间维度
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(1024, 2048),
+            nn.GELU(),
+            nn.Linear(2048, 3 * 224 * 224),  # RGB图像像素
+            nn.Tanh()  # 输出范围[-1, 1]
         )
 
-        # 质量预测器（预测生成特征的质量）
-        self.generation_quality_predictor = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
+        # === 获取正确的vocab_size ===
+        from . import clip
+        _tokenizer = clip._tokenizer
+        self.vocab_size = len(_tokenizer.encoder)  # 动态获取真实vocab_size
+        self.start_token = _tokenizer.encoder["<|startoftext|>"]
+        self.end_token = _tokenizer.encoder["<|endoftext|>"]
+
+        # === 用于训练的临时编码器（轻量级） ===
+        self.temp_img_encoder = nn.Sequential(
+            nn.AdaptiveAvgPool2d((14, 14)),  # 简化的图像编码
+            nn.Flatten(),
+            nn.Linear(3 * 14 * 14, 768),
+            nn.GELU(),
+            nn.Linear(768, 768)
         )
+
+        self.temp_text_encoder = nn.Sequential(
+            nn.Embedding(self.vocab_size, 512),  # 使用真实vocab_size
+            nn.GELU(),
+            nn.Linear(512, 512)
+        )
+
+        # === 对比学习头（用于训练） ===
+        self.img_contrastive_head = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+
+        self.text_contrastive_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+
+    def preprocess_missing_modalities(self, image_input, text_input, missing_type):
+        """
+        === 核心功能：在输入编码器前处理缺失模态 ===
+
+        Args:
+            image_input: [batch, 3, 224, 224] 原始图像（缺失时为零）
+            text_input: [batch, 77] 原始文本token（缺失时为零）
+            missing_type: [batch] 缺失类型
+
+        Returns:
+            processed_images: [batch, 3, 224, 224] 处理后的图像
+            processed_texts: [batch, 77] 处理后的文本token
+            generation_info: Dict 生成信息
+        """
+        batch_size = len(missing_type)
+        device = image_input.device
+
+        processed_images = image_input.clone()
+        processed_texts = text_input.clone()
+
+        generation_info = {
+            'generated_mask': torch.zeros(batch_size, 2).to(device),  # [img_generated, text_generated]
+            'complete_indices': []  # 完整样本的索引
+        }
+
+        # 记录完整样本索引（用于训练）
+        for i, miss_type in enumerate(missing_type):
+            if miss_type == 0:
+                generation_info['complete_indices'].append(i)
+
+        # 处理缺失模态
+        for i, miss_type in enumerate(missing_type):
+            if miss_type == 1:  # 缺失文本
+                # 从图像生成文本token
+                with torch.no_grad():  # 推理时不需要梯度
+                    # 使用临时编码器获取图像特征
+                    img_feat = self.temp_img_encoder(image_input[i:i + 1])  # [1, 768]
+
+                    # 生成文本token的logits
+                    text_logits = self.img_to_text_generator(img_feat)  # [1, 77]
+
+                    # 转换为token indices
+                    # 将tanh输出[-1,1]映射到token范围[0, vocab_size-1]
+                    text_tokens = ((text_logits + 1) / 2 * (self.vocab_size - 1)).long()  # [1, 77]
+                    text_tokens = torch.clamp(text_tokens, 0, self.vocab_size - 1)
+
+                    # 确保起始和结束token正确
+                    text_tokens[0, 0] = self.start_token  # start token
+                    text_tokens[0, -1] = self.end_token  # end token
+
+                    processed_texts[i] = text_tokens.squeeze(0)  # [77]
+
+                generation_info['generated_mask'][i, 1] = 1.0
+
+            elif miss_type == 2:  # 缺失图像
+                # 从文本生成图像
+                with torch.no_grad():
+                    # 使用临时编码器获取文本特征
+                    # 注意：需要先对token进行embedding
+                    text_embedded = self.temp_text_encoder[0](text_input[i:i + 1])  # [1, 77, 512]
+                    text_feat = text_embedded.mean(dim=1)  # [1, 512] 简单平均池化
+
+                    # 生成图像像素
+                    img_pixels = self.text_to_img_generator(text_feat)  # [1, 3*224*224]
+                    img_pixels = img_pixels.view(1, 3, 224, 224)  # [1, 3, 224, 224]
+
+                    # 确保像素值在合理范围内
+                    img_pixels = torch.clamp(img_pixels, -2.5, 2.5)  # CLIP的输入范围
+
+                    processed_images[i] = img_pixels.squeeze(0)  # [3, 224, 224]
+
+                generation_info['generated_mask'][i, 0] = 1.0
+
+        return processed_images, processed_texts, generation_info
+
+    def compute_generation_losses(self, image_input, text_input, missing_type):
+        """
+        === 训练时计算生成损失：只使用完整样本 ===
+
+        核心思路：
+        1. 找到完整样本（两个模态都有）
+        2. 模拟缺失：从一个模态生成另一个模态
+        3. 与真实模态计算损失
+        """
+        device = image_input.device
+        total_losses = {
+            'generation_consistency_loss': torch.tensor(0.0, device=device, requires_grad=True),
+            'contrastive_loss': torch.tensor(0.0, device=device, requires_grad=True)
+        }
+
+        # 找到完整样本
+        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
+
+        if len(complete_indices) < 2:  # 需要至少2个完整样本
+            return total_losses
+
+        # === 1. 生成一致性损失 ===
+        consistency_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        for i in complete_indices:
+            # 从图像生成文本，与真实文本比较
+            img_feat = self.temp_img_encoder(image_input[i:i + 1])
+            generated_text_logits = self.img_to_text_generator(img_feat)  # [1, 77]
+
+            # 真实文本的one-hot编码
+            real_text_onehot = F.one_hot(text_input[i:i + 1].long(),
+                                         num_classes=self.vocab_size).float()  # [1, 77, vocab]
+
+            # 将generated logits转换为概率分布
+            generated_text_probs = torch.softmax(generated_text_logits.unsqueeze(-1).expand(-1, -1, self.vocab_size),
+                                                 dim=-1)
+
+            # KL散度损失
+            text_gen_loss = F.kl_div(
+                F.log_softmax(generated_text_probs.view(-1, self.vocab_size), dim=-1),
+                real_text_onehot.view(-1, self.vocab_size),
+                reduction='batchmean'
+            )
+
+            # 从文本生成图像，与真实图像比较
+            text_embedded = self.temp_text_encoder[0](text_input[i:i + 1])
+            text_feat = text_embedded.mean(dim=1)
+            generated_img_pixels = self.text_to_img_generator(text_feat)  # [1, 3*224*224]
+            generated_img = generated_img_pixels.view(1, 3, 224, 224)
+
+            # 真实图像
+            real_img = image_input[i:i + 1]
+
+            # L2损失
+            img_gen_loss = F.mse_loss(generated_img, real_img)
+
+            consistency_loss = consistency_loss + text_gen_loss + img_gen_loss
+
+        consistency_loss = consistency_loss / len(complete_indices)
+        total_losses['generation_consistency_loss'] = consistency_loss
+
+        # === 2. 对比学习损失 ===
+        if len(complete_indices) >= 2:
+            # 提取完整样本的特征
+            complete_imgs = image_input[complete_indices]
+            complete_texts = text_input[complete_indices]
+
+            # 编码
+            img_features = self.temp_img_encoder(complete_imgs)  # [n, 768]
+            text_embedded = self.temp_text_encoder[0](complete_texts)  # [n, 77, 512]
+            text_features = text_embedded.mean(dim=1)  # [n, 512]
+
+            # 对比学习投影
+            img_proj = F.normalize(self.img_contrastive_head(img_features), dim=-1)  # [n, 128]
+            text_proj = F.normalize(self.text_contrastive_head(text_features), dim=-1)  # [n, 128]
+
+            # 对比损失
+            temperature = 0.07
+            sim_matrix = torch.matmul(img_proj, text_proj.T) / temperature  # [n, n]
+            labels = torch.arange(len(complete_indices)).to(device)
+
+            img_to_text_loss = F.cross_entropy(sim_matrix, labels)
+            text_to_img_loss = F.cross_entropy(sim_matrix.T, labels)
+
+            contrastive_loss = (img_to_text_loss + text_to_img_loss) / 2
+            total_losses['contrastive_loss'] = contrastive_loss
+
+        return total_losses
 
     def forward(self, image_features, text_features, missing_type):
         """
-        主要前向传播，同时进行生成和特征替代
-
-        Args:
-            image_features: [batch, 512] 图像特征（缺失时为提示学习输出）
-            text_features: [batch, 512] 文本特征（缺失时为提示学习输出）
-            missing_type: [batch] 缺失类型
-
-        Returns:
-            enhanced_features: Dict 包含所有特征的字典
+        === 保留兼容性接口（主要用于旧的特征空间处理） ===
+        现在这个方法主要用于保持接口兼容性
         """
-        batch_size = image_features.size(0)
-        device = image_features.device
-
-        # 初始化增强特征
-        enhanced_image_features = image_features.clone()
-        enhanced_text_features = text_features.clone()
-
-        # 记录生成信息
+        # 这个方法现在主要返回输入特征，不做实际生成
         generation_info = {
-            'generated_mask': torch.zeros(batch_size, 2).to(device),  # [img_generated, text_generated]
-            'generation_quality': torch.ones(batch_size, 2).to(device),  # 生成质量分数
-            'original_features': {
-                'image': image_features.clone(),
-                'text': text_features.clone()
-            }
+            'generated_mask': torch.zeros(len(missing_type), 2).to(image_features.device),
+            'generation_quality': torch.ones(len(missing_type), 2).to(image_features.device),
         }
 
-        # 处理每种缺失类型
-        for i, miss_type in enumerate(missing_type):
-            if miss_type == 1:  # 缺失文本
-                # 从图像生成文本特征
-                generated_text = self.img_to_text(
-                    image_features[i:i + 1],
-                    text_features[i:i + 1]  # 利用提示学习的输出作为先验
-                )
-
-                # 预测生成质量
-                quality_input = torch.cat([image_features[i:i + 1], generated_text], dim=-1)
-                gen_quality = self.generation_quality_predictor(quality_input)
-
-                # 替换特征
-                enhanced_text_features[i:i + 1] = generated_text
-                generation_info['generated_mask'][i, 1] = 1.0
-                generation_info['generation_quality'][i, 1] = gen_quality.squeeze()
-
-            elif miss_type == 2:  # 缺失图像
-                # 从文本生成图像特征
-                generated_image = self.text_to_img(
-                    text_features[i:i + 1],
-                    image_features[i:i + 1]  # 利用提示学习的输出作为先验
-                )
-
-                # 预测生成质量
-                quality_input = torch.cat([text_features[i:i + 1], generated_image], dim=-1)
-                gen_quality = self.generation_quality_predictor(quality_input)
-
-                # 替换特征
-                enhanced_image_features[i:i + 1] = generated_image
-                generation_info['generated_mask'][i, 0] = 1.0
-                generation_info['generation_quality'][i, 0] = gen_quality.squeeze()
-
         return {
-            'enhanced_image_features': enhanced_image_features,
-            'enhanced_text_features': enhanced_text_features,
+            'enhanced_image_features': image_features,
+            'enhanced_text_features': text_features,
             'generation_info': generation_info
         }
 
-    def compute_contrastive_loss(self, image_features, text_features, missing_type, temperature=0.07):
-        """
-        利用完整样本计算对比学习损失，训练生成器
+# === 冗余部分：可以删除的类 ===
+# class CrossModalGenerator(nn.Module):
+#     """这个类现在是冗余的，可以删除"""
+#     pass
 
-        Args:
-            image_features: [batch, 512] 图像特征
-            text_features: [batch, 512] 文本特征
-            missing_type: [batch] 缺失类型
-
-        Returns:
-            contrastive_loss: 对比学习损失
-        """
-        # 只使用完整样本进行对比学习
-        complete_mask = torch.tensor([mt == 0 for mt in missing_type]).to(image_features.device)
-
-        if not complete_mask.any():
-            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
-
-        # 提取完整样本
-        complete_img = image_features[complete_mask]  # [n_complete, 512]
-        complete_text = text_features[complete_mask]  # [n_complete, 512]
-
-        if complete_img.size(0) < 2:  # 需要至少2个完整样本
-            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
-
-        # 投影到对比空间
-        img_proj = F.normalize(self.contrastive_head_img(complete_img), dim=-1)  # [n_complete, 128]
-        text_proj = F.normalize(self.contrastive_head_text(complete_text), dim=-1)  # [n_complete, 128]
-
-        # 计算相似度矩阵
-        sim_matrix = torch.matmul(img_proj, text_proj.T) / temperature  # [n_complete, n_complete]
-
-        # 对比学习损失（InfoNCE）
-        labels = torch.arange(complete_img.size(0)).to(image_features.device)
-
-        # 图像到文本
-        img_to_text_loss = F.cross_entropy(sim_matrix, labels)
-        # 文本到图像
-        text_to_img_loss = F.cross_entropy(sim_matrix.T, labels)
-
-        contrastive_loss = (img_to_text_loss + text_to_img_loss) / 2
-
-        return contrastive_loss
-
-    def compute_generation_consistency_loss(self, image_features, text_features, missing_type):
-        """
-        计算生成一致性损失：生成的特征应该与真实模态相似
-        利用完整样本作为监督信号
-        """
-        consistency_loss = 0.0
-        count = 0
-
-        # 利用完整样本训练生成器
-        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
-
-        if len(complete_indices) < 2:
-            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
-
-        for i in complete_indices:
-            # 模拟缺失情况，测试生成质量
-            img_feat = image_features[i:i + 1]
-            text_feat = text_features[i:i + 1]
-
-            # 从图像生成文本，与真实文本比较
-            generated_text = self.img_to_text(img_feat, text_feat)
-            text_consistency_loss = F.mse_loss(generated_text, text_feat)
-
-            # 从文本生成图像，与真实图像比较
-            generated_image = self.text_to_img(text_feat, img_feat)
-            img_consistency_loss = F.mse_loss(generated_image, img_feat)
-
-            consistency_loss += (text_consistency_loss + img_consistency_loss)
-            count += 2
-
-        return consistency_loss / max(count, 1)
-
-    def compute_cycle_consistency_loss(self, image_features, text_features, missing_type):
-        """
-        计算循环一致性损失：图像→文本→图像 应该回到原图像
-        """
-        cycle_loss = 0.0
-        count = 0
-
-        # 只对完整样本计算循环损失
-        complete_indices = [i for i, mt in enumerate(missing_type) if mt == 0]
-
-        if len(complete_indices) == 0:
-            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
-
-        for i in complete_indices:
-            img_feat = image_features[i:i + 1]
-            text_feat = text_features[i:i + 1]
-
-            # 图像→文本→图像
-            fake_text = self.img_to_text(img_feat, text_feat)
-            reconstructed_img = self.text_to_img(fake_text, img_feat)
-            img_cycle_loss = F.mse_loss(reconstructed_img, img_feat)
-
-            # 文本→图像→文本
-            fake_img = self.text_to_img(text_feat, img_feat)
-            reconstructed_text = self.img_to_text(fake_img, text_feat)
-            text_cycle_loss = F.mse_loss(reconstructed_text, text_feat)
-
-            cycle_loss += (img_cycle_loss + text_cycle_loss)
-            count += 2
-
-        return cycle_loss / max(count, 1)
-
-    def compute_all_generation_losses(self, image_features, text_features, missing_type):
-        """
-        计算所有生成相关的损失
-
-        Returns:
-            dict: 包含各种损失的字典
-        """
-        losses = {}
-
-        # 1. 对比学习损失
-        losses['contrastive_loss'] = self.compute_contrastive_loss(
-            image_features, text_features, missing_type
-        )
-
-        # 2. 生成一致性损失
-        losses['generation_consistency_loss'] = self.compute_generation_consistency_loss(
-            image_features, text_features, missing_type
-        )
-
-        # 3. 循环一致性损失
-        losses['cycle_consistency_loss'] = self.compute_cycle_consistency_loss(
-            image_features, text_features, missing_type
-        )
-
-        # 4. 生成质量损失（自监督）
-        generation_results = self.forward(image_features, text_features, missing_type)
-        generation_quality = generation_results['generation_info']['generation_quality']
-
-        # 期望高质量生成
-        quality_target = torch.ones_like(generation_quality) * 0.8  # 目标质量
-        losses['generation_quality_loss'] = F.mse_loss(generation_quality, quality_target)
-
-        return losses
-
-
-class CrossModalGenerator(nn.Module):
-    """跨模态生成器的改进版本"""
-
-    def __init__(self, hidden_size=512, num_layers=3, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        # 输入投影
-        self.input_proj = nn.Linear(hidden_size, hidden_size)
-
-        # Transformer层
-        self.transformer_layers = nn.ModuleList([
-            TransformerBlock(hidden_size, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
-
-        # 输出投影
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.Tanh()
-        )
-
-        # 残差连接权重
-        self.residual_weight = nn.Parameter(torch.tensor(0.3))
-
-    def forward(self, source_feat, target_feat_prior=None):
-        """
-        Args:
-            source_feat: [batch, hidden_size] 源模态特征
-            target_feat_prior: [batch, hidden_size] 目标模态的先验（来自提示学习）
-        """
-        # 投影到序列维度
-        x = self.input_proj(source_feat).unsqueeze(1)  # [batch, 1, hidden_size]
-
-        # 如果有先验，用作上下文
-        if target_feat_prior is not None:
-            context = target_feat_prior.unsqueeze(1)  # [batch, 1, hidden_size]
-
-            # 将先验作为额外的上下文
-            x = torch.cat([x, context], dim=1)  # [batch, 2, hidden_size]
-
-        # Transformer生成
-        for layer in self.transformer_layers:
-            x = layer(x)
-
-        # 提取生成的特征（第一个位置）
-        generated = self.output_proj(x[:, 0, :])  # [batch, hidden_size]
-
-        # 如果有先验，进行残差连接
-        if target_feat_prior is not None:
-            generated = self.residual_weight * target_feat_prior + (1 - self.residual_weight) * generated
-
-        return generated
-
-
-class TransformerBlock(nn.Module):
-    """Transformer块"""
-
-    def __init__(self, hidden_size, num_heads, dropout=0.1):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        # x: [batch, seq_len, hidden_size]
-        x = x.transpose(0, 1)  # [seq_len, batch, hidden_size]
-
-        # Self-attention
-        attn_out, _ = self.attention(x, x, x)
-        x = self.norm1(x + attn_out)
-
-        # Feed-forward
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
-
-        return x.transpose(0, 1)  # [batch, seq_len, hidden_size]
+# class TransformerBlock(nn.Module):
+#     """这个类现在是冗余的，可以删除"""
+#     pass
