@@ -35,21 +35,21 @@ def config():
     test_ratio = None
     test_type = None
     test_exp_name = None
-    
+
     # fix backbone model (CLIP) weights
     fix_model = True
-    
+
     # missing modality config
     missing_ratio = {'train': 0.7, 'val': 0.7, 'test': 0.7}
-    missing_type = {'train': 'both', 'val': 'both', 'test': 'both'} # ['text', 'image', 'both'] in VL taskss
-    both_ratio = 0.5   # missing both ratio
+    missing_type = {'train': 'both', 'val': 'both', 'test': 'both'}  # ['text', 'image', 'both'] in VL taskss
+    both_ratio = 0.5  # missing both ratio
     missing_table_root = './datasets/missing_tables/'
     simulate_missing = False
-    
+
     # missing_aware_prompts config
     prompt_length = 36
     prompt_depth = 6
-        
+
     # Image setting
     train_transform_keys = ["CLIP_transform"]
     val_transform_keys = ["CLIP_transform"]
@@ -82,7 +82,7 @@ def config():
     get_recall_metric = False
     mmimdb_class_num = 23
     hatememes_class_num = 2
-    food101_class_num = 101    
+    food101_class_num = 101
 
     # PL Trainer Setting
     resume_from = None
@@ -190,12 +190,6 @@ def config():
     quality_log_interval = 100  # 质量分析日志间隔
 
 
-
-
-
-
-
-
 # Named configs for "environment" which define gpus and nodes, and paths
 @ex.named_config
 def env_dandelin():
@@ -294,6 +288,7 @@ def task_finetune_vqa_randaug():
     val_check_interval = 0.1
     lr_mult = 10
 
+
 @ex.named_config
 def task_finetune_hatememes():
     exp_name = "finetune_hatememes"
@@ -304,12 +299,13 @@ def task_finetune_hatememes():
     max_steps = None
     warmup_steps = 0.1
     draw_false_image = 0
-    learning_rate = 1e-2 
+    learning_rate = 1e-2
     val_check_interval = 0.11
     weight_decay = 2e-2
-#     optim_type = "adam"
-    max_text_len = 128 
-    
+    #     optim_type = "adam"
+    max_text_len = 128
+
+
 @ex.named_config
 def task_finetune_food101():
     exp_name = "finetune_food101"
@@ -323,24 +319,25 @@ def task_finetune_food101():
     learning_rate = 1e-2
     val_check_interval = 0.2
     weight_decay = 2e-2
-#     optim_type = "adam"
-    max_text_len = 512     
-    
+    #     optim_type = "adam"
+    max_text_len = 512
+
+
 @ex.named_config
 def task_finetune_mmimdb():
     exp_name = "finetune_mmimdb"
     datasets = ["mmimdb"]
     loss_names = _loss_names({"mmimdb": 1})
-#     loss_names = _loss_names({"mmimdb": 1, "prompt": -0.5})
+    #     loss_names = _loss_names({"mmimdb": 1, "prompt": -0.5})
     batch_size = 256
     max_epoch = 20
     max_steps = None
-    warmup_steps = 0.1
+    warmup_steps = 0.3
     draw_false_image = 0
     learning_rate = 1e-2
     val_check_interval = 0.2
     weight_decay = 2e-2
-#     optim_type = "adam"
+    #     optim_type = "adam"
     max_text_len = 1024
     # 【新增】模态生成器配置
     modal_generator_config = {
@@ -351,6 +348,7 @@ def task_finetune_mmimdb():
     }
     # 【新增】循环一致性损失权重
     cycle_loss_weight = 0.02
+
 
 @ex.named_config
 def task_finetune_irtr_coco():
