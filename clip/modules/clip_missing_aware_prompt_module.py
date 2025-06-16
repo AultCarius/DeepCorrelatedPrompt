@@ -921,6 +921,7 @@ class CustomCLIP(nn.Module):
             )
             total_losses['quality_loss'] = quality_loss
 
+
         # === 3. 一致性损失（基于embedding） ===
         if self.cached_embeddings is not None and self.training:
             consistency_loss = self._compute_embedding_consistency_loss(missing_type)
@@ -1157,9 +1158,12 @@ class CLIPransformerSS(pl.LightningModule):
 
         # Multi-label classification for MM-IMDb
         if "mmimdb" in self.current_tasks:
+
             ret.update(objectives.compute_mmimdb(self, batch))
+
             # ret.update(objectives.compute_enhanced_mmimdb(self, batch))
             # ret.update(objectives.compute_enhanced_mmimdb_v2(self, batch))
+
 
         # Classification for Food101
         if "food101" in self.current_tasks:
@@ -1195,7 +1199,6 @@ class CLIPransformerSS(pl.LightningModule):
             effective_quality_weight = self.quality_loss_weight
             effective_consistency_weight = self.consistency_loss_weight
 
-        # === 主任务计算 ===
         output = self(batch)
         main_loss = sum([v for k, v in output.items() if "loss" in k])
 
@@ -1531,6 +1534,7 @@ class CLIPransformerSS(pl.LightningModule):
             # 默认返回中等性能
             batch_size = len(batch["missing_type"])
             return torch.ones(batch_size, device=self.device) * 0.6
+
 
 
 
