@@ -77,44 +77,62 @@ class UpdatedQualityGuidedFusion(nn.Module):
         """
         从简化的质量分数中提取特征向量
         """
+
+        # 安全提取函数
+        def safe_extract_value(value):
+            if torch.is_tensor(value):
+                if value.dim() == 0:  # 0维tensor
+                    return value.item()
+                elif value.numel() == 1:  # 只有一个元素
+                    return value.item()
+                elif value.numel() > 0:  # 多个元素，取第一个
+                    return value.flatten()[0].item()
+                else:
+                    return 0.5  # 默认值
+            else:
+                return float(value)
+
         # 提取图像质量特征
         img_math = quality_score['image_quality']['mathematical']
-        img_norm_stability = img_math['norm_stability'][0] if torch.is_tensor(img_math['norm_stability']) else img_math[
-            'norm_stability']
-        img_entropy = img_math['information_entropy'][0] if torch.is_tensor(img_math['information_entropy']) else \
-        img_math['information_entropy']
-
-        img_task_relevance = quality_score['image_quality']['task_relevance']
-        if torch.is_tensor(img_task_relevance) and img_task_relevance.dim() > 0:
-            img_task_relevance = img_task_relevance.item()
+        img_norm_stability = safe_extract_value(img_math['norm_stability'])
+        img_entropy = safe_extract_value(img_math['information_entropy'])
+        img_task_relevance = safe_extract_value(quality_score['image_quality']['task_relevance'])
 
         # 提取文本质量特征
         text_math = quality_score['text_quality']['mathematical']
-        text_norm_stability = text_math['norm_stability'][0] if torch.is_tensor(text_math['norm_stability']) else \
-        text_math['norm_stability']
-        text_entropy = text_math['information_entropy'][0] if torch.is_tensor(text_math['information_entropy']) else \
-        text_math['information_entropy']
-
-        text_task_relevance = quality_score['text_quality']['task_relevance']
-        if torch.is_tensor(text_task_relevance) and text_task_relevance.dim() > 0:
-            text_task_relevance = text_task_relevance.item()
+        text_norm_stability = safe_extract_value(text_math['norm_stability'])
+        text_entropy = safe_extract_value(text_math['information_entropy'])
+        text_task_relevance = safe_extract_value(quality_score['text_quality']['task_relevance'])
 
         # 构建质量特征向量
         quality_vector = torch.tensor([
-            float(img_norm_stability),
-            float(img_entropy),
-            float(img_task_relevance),
-            float(text_norm_stability),
-            float(text_entropy),
-            float(text_task_relevance)
-        ]).to(next(self.parameters()).device)
+            img_norm_stability,
+            img_entropy,
+            img_task_relevance,
+            text_norm_stability,
+            text_entropy,
+            text_task_relevance
+        ], device=next(self.parameters()).device, dtype=torch.float32)
 
         return quality_vector
-
     def compute_modality_weights(self, quality_scores):
         """
         计算模态权重
         """
+
+        def safe_extract_value(value):
+            if torch.is_tensor(value):
+                if value.dim() == 0:  # 0维tensor
+                    return value.item()
+                elif value.numel() == 1:  # 只有一个元素
+                    return value.item()
+                elif value.numel() > 0:  # 多个元素，取第一个
+                    return value.flatten()[0].item()
+                else:
+                    return 0.5  # 默认值
+            else:
+                return float(value)
+
         batch_size = len(quality_scores)
         all_weights = []
 
@@ -132,7 +150,7 @@ class UpdatedQualityGuidedFusion(nn.Module):
             # 安全提取跨模态协同性
             cross_modal_consistency = quality_score['cross_modal_consistency']
             if 'network_consistency' in cross_modal_consistency:
-                synergy = cross_modal_consistency['network_consistency'][0]
+                synergy = safe_extract_value(cross_modal_consistency['network_consistency'])
             else:
                 synergy = torch.tensor(0.5).to(quality_weights.device)
 
@@ -207,7 +225,7 @@ class UpdatedQualityGuidedFusion(nn.Module):
             # 判断是否需要跨模态注意力
             cross_modal_consistency = quality_scores[i]['cross_modal_consistency']
             if 'network_consistency' in cross_modal_consistency:
-                consistency_score = cross_modal_consistency['network_consistency'][0]
+                consistency_score = cross_modal_consistency['network_consistency']
             else:
                 consistency_score = torch.tensor(0.5)
 
